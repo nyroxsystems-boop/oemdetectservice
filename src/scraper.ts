@@ -618,6 +618,11 @@ async function navigateToVehicle(page: Page, vin: string, brand?: string): Promi
     }
 
     await takeScreenshot(page, 'vin-result');
+    // Dump page body for debugging
+    try {
+      const bodyText = await page.locator('body').innerText({ timeout: 5000 });
+      logger.info('Page body after VIN (first 500 chars):', { body: bodyText.substring(0, 500) });
+    } catch { /* ignore */ }
     logger.warn('Vehicle catalog not clearly confirmed — proceeding', { vin });
     return true;
 
@@ -837,6 +842,18 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
 
     // Take debug screenshot
     await takeScreenshot(page, 'search-results');
+
+    // Dump page body for debugging extraction
+    try {
+      const bodyText = await page.locator('body').innerText({ timeout: 5000 });
+      logger.info('Page body after search (first 800 chars):', { body: bodyText.substring(0, 800) });
+      // Check if we're still on a catalog/search results page
+      if (bodyText.includes('Teilenummer')) {
+        logger.info('✅ "Teilenummer" found in page body — extraction should work');
+      } else {
+        logger.warn('⚠️ "Teilenummer" NOT found in page body — extraction will likely return 0');
+      }
+    } catch { /* ignore */ }
 
     // Extract OEM results
     const results = await extractOemResults(page);
