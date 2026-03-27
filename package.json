@@ -1,0 +1,26 @@
+{
+  "name": "@partsunion/catalog-scraper",
+  "version": "1.0.0",
+  "description": "Playwright-based OEM Parts Catalog scraper for PartsLink24",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "install:browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0",
+    "express": "^4.21.0",
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^16.4.5",
+    "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
