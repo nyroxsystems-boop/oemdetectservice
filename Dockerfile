@@ -3,22 +3,26 @@ FROM node:20-slim AS builder
 
 WORKDIR /app
 
-# Skip Playwright browser download (we use system Chromium)
+# Skip Playwright browser download (we use system Chromium in runtime)
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
-# Install ALL deps (including TypeScript for compilation)
+# Install ALL deps (including TypeScript + native build tools for better-sqlite3)
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY package*.json ./
 RUN npm ci
 
-# Copy source and compile TypeScript
+# Compile TypeScript
 COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npx tsc
 
+# Prune dev dependencies (keep only production deps with compiled native modules)
+RUN npm prune --production
+
 # ── Runtime Stage ─────────────────────────────────────────────────
 FROM node:20-slim
 
-# Install Chromium + dependencies for Playwright
+# Install Chromium + minimal deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     fonts-liberation \
@@ -32,17 +36,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Skip Playwright browser download in runtime too
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # Tell Playwright to use system Chromium
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Copy compiled JS only (no dev deps needed)
+# Copy compiled JS + production node_modules (with pre-built native modules)
 COPY --from=builder /app/dist ./dist
-COPY package*.json ./
-
-# Install production deps only (skip Playwright browser download)
-RUN npm ci --only=production && npm cache clean --force
+COPY --from=builder /app/node_modules ./node_modules
+COPY package.json ./
 
 # Create data directory
 RUN mkdir -p /app/playwright-data
