@@ -210,6 +210,56 @@ async function login(page: Page): Promise<boolean> {
     await waitForStable(page);
     await humanDelay(1000, 2000);
 
+    // ── Dismiss Usercentrics cookie consent overlay ──
+    // This MUST happen before any clicks, because it intercepts all pointer events
+    try {
+      // Try shadow DOM button first (Usercentrics v2 uses shadow DOM)
+      const ucRoot = page.locator('#usercentrics-root');
+      if (await ucRoot.count() > 0) {
+        logger.info('Cookie consent overlay detected — dismissing...');
+        
+        // Method 1: Try clicking common accept buttons
+        const acceptSelectors = [
+          'button[data-testid="uc-accept-all-button"]',
+          'button:has-text("Alle akzeptieren")',
+          'button:has-text("Accept All")',
+          'button:has-text("Akzeptieren")',
+          'button:has-text("Zustimmen")',
+          '#uc-btn-accept-banner',
+        ];
+        
+        let dismissed = false;
+        for (const sel of acceptSelectors) {
+          try {
+            const btn = page.locator(sel).first();
+            if (await btn.count() > 0 && await btn.isVisible({ timeout: 2000 })) {
+              await btn.click({ timeout: 3000 });
+              logger.info(`Cookie consent dismissed via: ${sel}`);
+              dismissed = true;
+              break;
+            }
+          } catch { /* try next selector */ }
+        }
+        
+        // Method 2: Force-remove the overlay via JS
+        if (!dismissed) {
+          await page.evaluate(() => {
+            const uc = document.getElementById('usercentrics-root');
+            if (uc) uc.remove();
+            // Also remove any lingering overlay divs
+            document.querySelectorAll('[class*="overlay"], [class*="consent"], [class*="cookie"]').forEach(el => {
+              if (el instanceof HTMLElement && el.style.position === 'fixed') el.remove();
+            });
+          });
+          logger.info('Cookie consent force-removed via JS');
+        }
+        
+        await humanDelay(500, 1000);
+      }
+    } catch (err: any) {
+      logger.warn('Cookie consent dismissal failed — continuing anyway', { error: err.message });
+    }
+
     // Check for bot detection before login
     await assertNotBlocked(page, 'pre-login');
 
