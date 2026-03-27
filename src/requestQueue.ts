@@ -32,7 +32,7 @@ export interface QueueStats {
 
 const CIRCUIT_BREAKER_THRESHOLD = 5;    // Open after 5 consecutive failures
 const CIRCUIT_BREAKER_RESET_MS = 5 * 60 * 1000; // Reset after 5 minutes
-const JOB_TIMEOUT_MS = 120_000;         // Max 120s per job
+const JOB_TIMEOUT_MS = 300_000;         // Max 300s per job (PL24 VIN lookup can take 80s+)
 
 let consecutiveFailures = 0;
 let circuitBreakerOpenedAt: number | null = null;
