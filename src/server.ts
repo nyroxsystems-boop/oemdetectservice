@@ -18,6 +18,17 @@ import { config } from './config';
 const app = express();
 app.use(express.json());
 
+// ── CORS — Allow dashboard to call this service from the browser ─────────────
+app.use((_req: Request, res: Response, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (_req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
 // ── Middleware: Request logging ──────────────────────────────────────────────
 
 app.use((req: Request, res: Response, next) => {
