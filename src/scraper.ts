@@ -584,27 +584,28 @@ async function navigateToVehicle(page: Page, vin: string, brand?: string): Promi
       } catch { /* ignore */ }
     }
 
-    // Find the frame containing the GO button
+    // Find the frame containing the GO button (it's a <div class="search-btn">, NOT a <button>)
     let contentFrame: any = null;
     for (const frame of frames) {
       try {
-        const goCount = await frame.locator('input[value="GO"]').count();
+        // PL24 GO button: <div class="search-btn" onclick="searchText();"><div id="tooltip-go">GO</div></div>
+        const goCount = await frame.locator('div.search-btn, #tooltip-go').count();
         if (goCount > 0) {
           contentFrame = frame;
-          logger.info(`✅ Found GO button in frame: "${frame.name()}"`);
+          logger.info(`✅ Found GO button (div.search-btn) in frame: "${frame.name()}"`);
           break;
         }
       } catch { /* skip */ }
     }
 
-    // Fallback: frame with "Fahrgestellnummer" or brand images
+    // Fallback: frame with VIN input placeholder or brand images
     if (!contentFrame) {
       for (const frame of frames) {
         try {
-          const body = await frame.locator('body').innerText({ timeout: 3000 });
-          if (body.includes('Fahrgestellnummer') || body.includes('Herzlich willkommen')) {
+          const vinInput = await frame.locator('input[placeholder="Fahrgestellnummer"]').count();
+          if (vinInput > 0) {
             contentFrame = frame;
-            logger.info(`Found content frame via text: "${frame.name()}"`);
+            logger.info(`Found content frame via VIN placeholder: "${frame.name()}"`);
             break;
           }
         } catch { /* skip */ }
@@ -632,10 +633,12 @@ async function navigateToVehicle(page: Page, vin: string, brand?: string): Promi
     }
 
     // Find VIN input IN the frame
+    // Exact HTML: <input name="text" type="text" placeholder="Fahrgestellnummer" maxLength="17">
     let vinField: any = null;
     const vinSels = [
-      'input[name*="fahrgestell" i]', 'input[name*="vin" i]', 'input[name*="fin" i]',
-      'input[id*="vin" i]', 'input[id*="fin" i]', 'input[id*="fahrgestell" i]',
+      'input[placeholder="Fahrgestellnummer"]',   // EXACT match from DevTools
+      'input[name="text"][maxlength="17"]',        // form field for VIN
+      'input[name*="fahrgestell" i]', 'input[name*="vin" i]',
     ];
     for (const sel of vinSels) {
       try {
@@ -648,12 +651,11 @@ async function navigateToVehicle(page: Page, vin: string, brand?: string): Promi
       } catch { /* next */ }
     }
 
-    // Fallback: input next to GO
+    // Fallback: input inside form[name="search-text"]
     if (!vinField) {
       try {
-        const goParent = contentFrame.locator('input[value="GO"]').locator('..');
-        const inputs = await goParent.locator('input[type="text"]').all();
-        if (inputs.length > 0) { vinField = inputs[0]; logger.info('Found VIN as GO sibling'); }
+        const formInput = contentFrame.locator('form[name="search-text"] input[type="text"]').first();
+        if (await formInput.count() > 0) { vinField = formInput; logger.info('Found VIN via form[name=search-text]'); }
       } catch { /* ignore */ }
     }
 
@@ -672,11 +674,19 @@ async function navigateToVehicle(page: Page, vin: string, brand?: string): Promi
     logger.info('VIN entered');
 
     // Click GO IN the frame
+    // Exact HTML: <div class="search-btn" onclick="searchText();return false;"><div id="tooltip-go">GO</div></div>
+    // Also: <input id="hidden-search" class="auto-submit" type="submit" onclick="searchText();return false;">
     let goClicked = false;
-    for (const sel of ['input[value="GO"]', 'button:has-text("GO")', 'input[type="submit"]']) {
+    const goSels = [
+      'div.search-btn',                    // EXACT match — the visible GO div
+      '#tooltip-go',                        // inner GO text div
+      '#hidden-search',                     // hidden submit input
+      'input[type="submit"]',              // generic submit
+    ];
+    for (const sel of goSels) {
       try {
         const btn = contentFrame.locator(sel).first();
-        if (await btn.count() > 0 && await btn.isVisible()) {
+        if (await btn.count() > 0) {
           logger.info(`Clicking GO: ${sel}`);
           await btn.click();
           goClicked = true;
@@ -786,17 +796,18 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
     // Take debug screenshot
     await takeScreenshot(page, 'search-results');
 
-    // Dump page body for debugging extraction
-    try {
-      const bodyText = await page.locator('body').innerText({ timeout: 5000 });
-      logger.info('Page body after search (first 800 chars):', { body: bodyText.substring(0, 800) });
-      // Check if we're still on a catalog/search results page
-      if (bodyText.includes('Teilenummer')) {
-        logger.info('✅ "Teilenummer" found in page body — extraction should work');
-      } else {
-        logger.warn('⚠️ "Teilenummer" NOT found in page body — extraction will likely return 0');
-      }
-    } catch { /* ignore */ }
+    // Dump frame content for debugging extraction
+    for (const frame of page.frames()) {
+      try {
+        const bodyText = await frame.locator('body').innerText({ timeout: 3000 });
+        if (bodyText.length > 50) {
+          logger.info(`Frame "${frame.name()}" body (first 400 chars):`, { body: bodyText.substring(0, 400) });
+          if (bodyText.includes('Teilenummer')) {
+            logger.info(`✅ "Teilenummer" found in frame "${frame.name()}" — extraction should work`);
+          }
+        }
+      } catch { /* skip */ }
+    }
 
     // Extract OEM results
     const results = await extractOemResults(page);
@@ -814,39 +825,50 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
 }
 
 async function findSearchInput(page: Page): Promise<Locator | null> {
-  // Named selectors for "Teile suchen"
+  // Exact HTML from DevTools: <input placeholder="Teile suchen" type="text" class="MuiInputBase-input...">
+  // Parent: <div id="partSearchInput">
+  // The catalog view loads in a FRAME, so scan all frames
   const selectors = [
+    'input[placeholder="Teile suchen"]',           // EXACT match from DevTools
+    '#partSearchInput input[type="text"]',          // parent container
     'input[placeholder*="Teile suchen" i]',
     'input[placeholder*="suchen" i]',
-    'input[name*="search" i]',
-    'input[name*="teile" i]',
-    'input[name*="query" i]',
-    'input[id*="search" i]',
-    'input[id*="teile" i]',
-    'input[type="search"]',
   ];
 
+  // Try main page first
   for (const sel of selectors) {
     try {
       const el = page.locator(sel).first();
       if (await el.count() > 0 && await el.isVisible()) {
-        logger.debug(`Found search field via: ${sel}`);
+        logger.info(`Found search field on main page: ${sel}`);
         return el;
       }
     } catch { /* try next */ }
   }
 
-  // Positional: second visible text input (first = VIN, second = search)
-  try {
-    const allInputs = await page.locator('input[type="text"]:visible').all();
-    if (allInputs.length >= 2) {
-      logger.info('Using second visible text input as "Teile suchen" field');
-      return allInputs[1];
-    } else if (allInputs.length === 1) {
-      logger.info('Only 1 text input — using it as search field');
-      return allInputs[0];
+  // Try ALL frames
+  for (const frame of page.frames()) {
+    for (const sel of selectors) {
+      try {
+        const el = frame.locator(sel).first();
+        if (await el.count() > 0) {
+          logger.info(`Found search field in frame "${frame.name()}": ${sel}`);
+          return el;
+        }
+      } catch { /* try next */ }
     }
-  } catch { /* ignore */ }
+  }
+
+  // Positional fallback (second visible text input in any frame)
+  for (const frame of page.frames()) {
+    try {
+      const allInputs = await frame.locator('input[type="text"]:visible').all();
+      if (allInputs.length >= 2) {
+        logger.info(`Using second text input in frame "${frame.name()}" (${allInputs.length} total)`);
+        return allInputs[1];
+      }
+    } catch { /* ignore */ }
+  }
 
   return null;
 }
