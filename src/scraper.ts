@@ -264,88 +264,106 @@ async function login(page: Page): Promise<boolean> {
     // Check for bot detection before login
     await assertNotBlocked(page, 'pre-login');
 
-    // ── Find the 3 login fields ──
-    // Real PL24 login form has exactly 3 inputs in right panel:
-    //   1. "Firmenkennung / ID:" → text input
-    //   2. "Benutzername:" → text input
-    //   3. "Passwort:" → password input
+    // ── Find and fill the 3 login fields ──
+    // Real PL24 login form (verified March 2026):
+    //   Right panel with exactly 3 inputs:
+    //     1. "Firmenkennung / ID:" → text input
+    //     2. "Benutzername:"       → text input
+    //     3. "Passwort:"           → password input
+    //
+    // STRATEGY: Use positional approach — most reliable across environments.
+    // Find all visible text inputs + the password field, fill by position.
 
-    let companyField: Locator | null = null;
-    let userField: Locator | null = null;
-    let passField: Locator | null = null;
-
-    // Strategy 1: Find by exact label text (from screenshot)
-    // PL24 uses plain text labels, not <label> elements, so we search for nearby text + input
+    // Wait for form to be ready
+    const passField = page.locator('input[type="password"]:visible').first();
     try {
-      // "Firmenkennung / ID:" — find text then look for sibling/child input
-      companyField = page.locator('text=Firmenkennung').locator('..').locator('input[type="text"]').first();
-      if (await companyField.count() === 0) companyField = null;
-    } catch { companyField = null; }
-
-    try {
-      userField = page.locator('text=Benutzername').locator('..').locator('input[type="text"]').first();
-      if (await userField.count() === 0) userField = null;
-    } catch { userField = null; }
-
-    // Password field is always the most reliable
-    passField = page.locator('input[type="password"]').first();
-
-    // Strategy 2: Positional fallback — PL24 login has exactly 2 text + 1 password inputs
-    if (!companyField || !userField) {
-      const textInputs = await page.locator('input[type="text"]:visible').all();
-      const passInputs = await page.locator('input[type="password"]:visible').all();
-
-      logger.info(`Login form discovery: ${textInputs.length} text inputs, ${passInputs.length} password inputs`);
-
-      if (textInputs.length >= 2) {
-        // Order: Firmenkennung (1st), Benutzername (2nd)
-        if (!companyField) companyField = textInputs[0];
-        if (!userField) userField = textInputs[1];
-        logger.info('Using positional login strategy (2+ text inputs found)');
-      } else if (textInputs.length === 1 && passInputs.length >= 1) {
-        if (!userField) userField = textInputs[0];
-        logger.info('Only 1 text input found — company might be pre-filled');
-      }
+      await passField.waitFor({ state: 'visible', timeout: 10000 });
+    } catch {
+      logger.error('Password field not visible within 10s — login form not loaded');
+      await takeScreenshot(page, 'login-no-form');
+      return false;
     }
 
-    if (!passField || await passField.count() === 0) {
-      logger.error('Password field not found — cannot login');
+    // Get ALL visible text inputs on the page
+    const textInputs = await page.locator('input[type="text"]:visible').all();
+    const passInputs = await page.locator('input[type="password"]:visible').all();
+    logger.info(`Login form: ${textInputs.length} text inputs, ${passInputs.length} password inputs found`);
+
+    if (textInputs.length < 2) {
+      logger.error(`Expected 2+ text inputs for login, found ${textInputs.length}`);
+      await takeScreenshot(page, 'login-wrong-inputs');
+      return false;
+    }
+
+    if (passInputs.length < 1) {
+      logger.error('No password input found');
       await takeScreenshot(page, 'login-no-password');
       return false;
     }
 
-    // Fill the fields in order
-    if (companyField && await companyField.count() > 0) {
-      await companyField.click();
-      await humanDelay(100, 300);
-      await companyField.fill('');
-      await companyField.type(config.pl24.companyId, { delay: 30 });
-      await humanDelay(200, 500);
-      logger.debug('Filled Firmenkennung / ID');
-    }
+    // Fill Firmenkennung / ID (1st text input)
+    const companyField = textInputs[0];
+    await companyField.click();
+    await humanDelay(100, 200);
+    await companyField.fill(config.pl24.companyId);
+    await humanDelay(200, 400);
+    logger.info(`Filled Firmenkennung: "${config.pl24.companyId}"`);
 
-    if (userField && await userField.count() > 0) {
-      await userField.click();
-      await humanDelay(100, 300);
-      await userField.fill('');
-      await userField.type(config.pl24.username, { delay: 30 });
-      await humanDelay(200, 500);
-      logger.debug('Filled Benutzername');
-    }
+    // Fill Benutzername (2nd text input)
+    const userField = textInputs[1];
+    await userField.click();
+    await humanDelay(100, 200);
+    await userField.fill(config.pl24.username);
+    await humanDelay(200, 400);
+    logger.info(`Filled Benutzername: "${config.pl24.username}"`);
 
+    // Fill Passwort (password input)
     await passField.click();
-    await humanDelay(100, 300);
-    await passField.fill('');
-    await passField.type(config.pl24.password, { delay: 30 });
-    await humanDelay(300, 600);
-    logger.debug('Filled Passwort');
+    await humanDelay(100, 200);
+    await passField.fill(config.pl24.password);
+    await humanDelay(200, 400);
+    logger.info('Filled Passwort: ****');
 
-    // Click "Login" button — real PL24 has a "Login" button below the form
-    const loginBtn = page.locator('button:has-text("Login"), input[value="Login"], a:has-text("Login")').first();
-    if (await loginBtn.count() > 0) {
-      logger.info('Clicking "Login" button');
-      await loginBtn.click();
-    } else {
+    // Debug: take screenshot BEFORE clicking login to verify fields are filled
+    await takeScreenshot(page, 'login-before-submit');
+
+    // Verify field values via JS (debug)
+    try {
+      const fieldValues: any = await page.evaluate(`
+        (() => {
+          const texts = Array.from(document.querySelectorAll('input[type="text"]'))
+            .filter(i => i.offsetParent !== null)
+            .map(i => i.value);
+          const pass = document.querySelector('input[type="password"]')?.value?.length || 0;
+          return { textValues: texts, passLength: pass };
+        })()
+      `);
+      logger.info(`Field verification — text values: ${JSON.stringify(fieldValues.textValues)}, password length: ${fieldValues.passLength}`);
+    } catch { /* ignore */ }
+
+    // Click "Login" button
+    let loginClicked = false;
+    const loginSelectors = [
+      'input[value="Login"]',                      // input submit button
+      'input[type="submit"][value="Login"]',
+      'button:has-text("Login")',                   // button element
+      'a:has-text("Login")',                        // link styled as button
+      'input[type="submit"]',                       // generic submit
+    ];
+
+    for (const sel of loginSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        if (await btn.count() > 0 && await btn.isVisible({ timeout: 2000 })) {
+          logger.info(`Clicking Login via: ${sel}`);
+          await btn.click();
+          loginClicked = true;
+          break;
+        }
+      } catch { /* try next */ }
+    }
+
+    if (!loginClicked) {
       // Fallback: submit via Enter on password field
       logger.info('No Login button found — pressing Enter');
       await passField.press('Enter');
