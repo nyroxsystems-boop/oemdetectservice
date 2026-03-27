@@ -25,21 +25,22 @@ FROM node:20-slim
 
 WORKDIR /app
 
+# Store Playwright browsers in a shared, predictable location
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+
 # Copy compiled JS + production node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY package.json ./
 
-# Install Playwright's OWN matching Chromium + system deps
-# This ensures version compatibility between Playwright and Chromium
+# Install Playwright's matching Chromium + system deps into shared path
 RUN npx playwright install chromium --with-deps
 
-# Create data directory
-RUN mkdir -p /app/playwright-data
-
-# Non-root user
-RUN groupadd -r scraper && useradd -r -g scraper -G audio,video scraper \
+# Create data directory + non-root user
+RUN mkdir -p /app/playwright-data \
+    && groupadd -r scraper && useradd -r -g scraper -G audio,video scraper \
     && chown -R scraper:scraper /app /tmp
+
 USER scraper
 
 EXPOSE 4100
