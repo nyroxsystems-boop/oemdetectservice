@@ -572,20 +572,63 @@ async function navigateToVehicle(page: Page, vin: string, brand?: string): Promi
   logger.info('Navigating to vehicle...', { vin, brand });
 
   try {
-    // Step 1: Select brand (on dashboard)
-    if (brand) {
+    // Step 1: Check if we need to select a brand first
+    if (brand && brand !== 'auto') {
       const brandSelected = await selectBrand(page, brand);
       if (!brandSelected) {
         logger.warn('Could not select brand — trying VIN input directly');
       }
+      await humanDelay(500, 1000);
     }
 
-    await humanDelay(500, 1000);
+    // Step 2: Find the VIN input field
+    // PL24 dashboard has VIN input ABOVE the brand grid with a "GO" button
+    let vinField: Locator | null = null;
 
-    // Step 2: Find VIN input
-    // Dashboard: labeled "FAHRGESTELLNUMMER" with "GO" button
-    // Catalog view: VIN input in top bar (first input, shows current VIN)
-    let vinField = await findVinInput(page);
+    // Try named selectors first
+    const vinSelectors = [
+      'input[name*="fahrgestell" i]', 'input[name*="vin" i]', 'input[name*="fin" i]',
+      'input[placeholder*="Fahrgestell" i]', 'input[placeholder*="VIN" i]',
+      'input[id*="vin" i]', 'input[id*="fin" i]', 'input[id*="fahrgestell" i]',
+    ];
+    for (const sel of vinSelectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.count() > 0 && await el.isVisible()) {
+          vinField = el;
+          logger.info(`Found VIN field via: ${sel}`);
+          break;
+        }
+      } catch { /* try next */ }
+    }
+
+    // Fallback: find input next to GO button
+    if (!vinField) {
+      try {
+        // The GO button is next to the VIN input
+        const goBtn = page.locator('input[value="GO"], button:has-text("GO"), a:has-text("GO")').first();
+        if (await goBtn.count() > 0) {
+          // VIN input is a sibling of GO
+          const parent = goBtn.locator('..');
+          const inputs = await parent.locator('input[type="text"]').all();
+          if (inputs.length > 0) {
+            vinField = inputs[0];
+            logger.info('Found VIN field as sibling of GO button');
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Fallback: positional (first text input)
+    if (!vinField) {
+      try {
+        const allInputs = await page.locator('input[type="text"]:visible').all();
+        if (allInputs.length >= 1) {
+          vinField = allInputs[0];
+          logger.info(`Using first visible text input as VIN field (${allInputs.length} total)`);
+        }
+      } catch { /* ignore */ }
+    }
 
     if (!vinField) {
       logger.error('VIN input field not found!');
@@ -593,7 +636,7 @@ async function navigateToVehicle(page: Page, vin: string, brand?: string): Promi
       return false;
     }
 
-    // Clear and type VIN (human-like)
+    // Step 3: Enter VIN
     await vinField.click();
     await humanDelay(100, 300);
     await vinField.fill('');
@@ -601,29 +644,107 @@ async function navigateToVehicle(page: Page, vin: string, brand?: string): Promi
     await vinField.type(vin, { delay: 50 });
     await humanDelay(300, 600);
 
-    // Submit VIN — "GO" button on dashboard, magnifying glass on catalog
-    await submitVinSearch(page, vinField);
-
-    // Wait for catalog to load
-    await waitForCatalogLoad(page, vin);
-    await humanDelay(1500, 3000);
-
-    // Check for bot detection
-    await assertNotBlocked(page, 'VIN-lookup');
-
-    // Verify catalog view loaded
-    if (await verifyCatalogView(page, vin)) {
-      logger.info('✅ Vehicle identified successfully', { vin });
-      return true;
+    // Step 4: Click "GO" button explicitly
+    let goClicked = false;
+    const goSelectors = [
+      'input[value="GO"]',
+      'button:has-text("GO")',
+      'a:has-text("GO")',
+      'input[type="submit"][value="GO"]',
+    ];
+    for (const sel of goSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        if (await btn.count() > 0 && await btn.isVisible()) {
+          logger.info(`Clicking GO button: ${sel}`);
+          await btn.click();
+          goClicked = true;
+          break;
+        }
+      } catch { /* try next */ }
     }
 
-    await takeScreenshot(page, 'vin-result');
-    // Dump page body for debugging
+    if (!goClicked) {
+      logger.info('GO button not found — pressing Enter');
+      await vinField.press('Enter');
+    }
+
+    // Step 5: Wait for navigation / catalog to load
+    logger.info('Waiting for catalog to load after VIN submission...');
+    
+    // Wait for page URL to change or new content to appear
+    await page.waitForTimeout(3000);
+    
+    // Check ALL frames for catalog content (PL24 may use iframes)
+    let catalogFrame: Page | any = page;
+    const frames = page.frames();
+    logger.info(`Page has ${frames.length} frames`);
+    
+    for (const frame of frames) {
+      try {
+        const frameText = await frame.locator('body').innerText({ timeout: 3000 });
+        if (frameText.includes('Hauptgruppe') || frameText.includes('Fahrzeugidentifikation') || 
+            frameText.includes('Teile suchen') || frameText.includes('Modellbezeichnung')) {
+          logger.info('✅ Found catalog content in frame!');
+          catalogFrame = frame;
+          break;
+        }
+      } catch { /* frame might not be accessible */ }
+    }
+
+    // Wait longer for catalog signals
+    const catalogSignals = [
+      'text=Hauptgruppe', 'text=Fahrzeugidentifikation',
+      'text=Teile suchen', 'text=Modellbezeichnung',
+      `text=${vin}`,
+    ];
+    
+    let catalogFound = false;
+    for (const signal of catalogSignals) {
+      try {
+        await page.locator(signal).first().waitFor({ state: 'visible', timeout: 30000 });
+        logger.info(`✅ Catalog signal found: "${signal}"`);
+        catalogFound = true;
+        break;
+      } catch { /* try next signal */ }
+    }
+
+    if (!catalogFound) {
+      // Try frames again
+      for (const frame of page.frames()) {
+        for (const signal of catalogSignals) {
+          try {
+            const loc = frame.locator(signal.replace('text=', '')).first();
+            if (await loc.count() > 0) {
+              logger.info(`✅ Catalog signal found in frame: "${signal}"`);
+              catalogFound = true;
+              break;
+            }
+          } catch { /* ignore */ }
+        }
+        if (catalogFound) break;
+      }
+    }
+
+    // Dump current page state for debugging
     try {
+      const url = page.url();
       const bodyText = await page.locator('body').innerText({ timeout: 5000 });
-      logger.info('Page body after VIN (first 500 chars):', { body: bodyText.substring(0, 500) });
+      logger.info('Page state after GO click:', { 
+        url,
+        catalogFound,
+        frameCount: page.frames().length,
+        body: bodyText.substring(0, 500) 
+      });
     } catch { /* ignore */ }
-    logger.warn('Vehicle catalog not clearly confirmed — proceeding', { vin });
+
+    if (catalogFound) {
+      logger.info('✅ Vehicle identified successfully', { vin });
+    } else {
+      await takeScreenshot(page, 'vin-result');
+      logger.warn('Vehicle catalog not confirmed — VIN may not exist in PL24', { vin });
+    }
+
     return true;
 
   } catch (err: any) {
