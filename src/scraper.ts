@@ -351,24 +351,48 @@ async function login(page: Page): Promise<boolean> {
       await passField.press('Enter');
     }
 
-    // Wait for redirect after login → should land on dashboard
-    await waitForStable(page, NAVIGATION_TIMEOUT);
-    await humanDelay(1500, 3000);
+     // Wait for redirect after login → should land on dashboard
+    // PL24 may keep the same URL (login.do) but load dashboard content.
+    // Wait for reliable dashboard indicator: "Abmelden" link in nav.
+    logger.info('Waiting for dashboard to load...');
+    let dashboardLoaded = false;
+
+    try {
+      // Wait for "Abmelden" to appear — it ONLY exists on the dashboard, never on the login page
+      await page.locator('text=Abmelden').first().waitFor({ state: 'visible', timeout: 15000 });
+      dashboardLoaded = true;
+      logger.info('Dashboard detected — "Abmelden" visible');
+    } catch {
+      logger.warn('"Abmelden" not found within 15s — checking other signals');
+    }
+
+    // Fallback: check for "Herzlich willkommen" (also unique to dashboard)
+    if (!dashboardLoaded) {
+      try {
+        await page.locator('text=Herzlich willkommen').first().waitFor({ state: 'visible', timeout: 5000 });
+        dashboardLoaded = true;
+        logger.info('Dashboard detected — "Herzlich willkommen" visible');
+      } catch {
+        logger.warn('"Herzlich willkommen" not found');
+      }
+    }
 
     // Check for bot detection post-login
     await assertNotBlocked(page, 'post-login');
 
-    // Verify login success
-    const success = await verifyLoginSuccess(page);
+    if (!dashboardLoaded) {
+      // Final verification attempt
+      dashboardLoaded = await verifyLoginSuccess(page);
+    }
 
-    if (success) {
+    if (dashboardLoaded) {
       isLoggedIn = true;
       try { await context!.storageState({ path: STORAGE_PATH }); } catch { /* ignore */ }
       logger.info('✅ Login successful!');
       return true;
     }
 
-    logger.error('Login failed — could not verify success');
+    logger.error('Login failed — dashboard did not load');
     await takeScreenshot(page, 'login-failed');
     return false;
 
@@ -382,12 +406,15 @@ async function login(page: Page): Promise<boolean> {
 /**
  * Verify login success by checking for dashboard indicators.
  *
- * Real PL24 dashboard (from screenshot 4) shows:
- * - "Abmelden" link in top nav
- * - "Herzlich willkommen bei partslink24..."
- * - "FAHRGESTELLNUMMER" input label
- * - "Verwaltung" section
- * - Brand logos grid
+ * CRITICAL: Check NEGATIVE signals FIRST to prevent false positives!
+ * The login page contains "Fahrgestellnummerneinstieg" in its marketing text,
+ * which would falsely match a naive "fahrgestellnummer" check.
+ *
+ * Real PL24 dashboard (verified March 2026) shows:
+ * - "Abmelden" link in top nav (UNIQUE to dashboard — never on login page)
+ * - "Herzlich willkommen bei partslink24..." (UNIQUE to dashboard)
+ * - "FAHRGESTELLNUMMER" input label (but this text also appears on login page!)
+ * - "Verwaltung" section (UNIQUE to dashboard)
  */
 async function verifyLoginSuccess(page: Page): Promise<boolean> {
   let bodyText: string;
@@ -399,44 +426,14 @@ async function verifyLoginSuccess(page: Page): Promise<boolean> {
 
   const lower = bodyText.toLowerCase();
 
-  // Positive signals — real PL24 dashboard contains these
-  const positiveSignals = [
-    'abmelden',                     // Top nav link
-    'herzlich willkommen',          // Dashboard welcome text
-    'fahrgestellnummer',            // VIN input label on dashboard
-    'verwaltung',                   // Right panel section
-    'kurzeinstieg',                 // Dashboard link
-    'händler auswählen',            // Dashboard link
-    'original teile katalog',       // Dashboard description
-  ];
-
-  for (const signal of positiveSignals) {
-    if (lower.includes(signal)) {
-      logger.info(`Login verified via: "${signal}"`);
-      return true;
-    }
-  }
-
-  // Also check catalog view signals (in case session restored directly to catalog)
-  const catalogSignals = [
-    'fahrzeugidentifikation',       // Left panel
-    'hauptgruppe',                  // Main table
-    'teile suchen',                 // Search input
-  ];
-
-  for (const signal of catalogSignals) {
-    if (lower.includes(signal)) {
-      logger.info(`Login verified via catalog signal: "${signal}"`);
-      return true;
-    }
-  }
-
-  // Negative signals — still on login page
+  // ── STEP 1: Check NEGATIVE signals FIRST ──
+  // These indicate we're still on the login page — must check before positives!
   const negativeSignals = [
-    'passwort vergessen',           // Login page element
-    'kennwort falsch',
+    'passwort vergessen',           // Login page "forgot password" link
     'anmeldung für registrierte',   // Login page header text
-    'neu bei partslink24',          // Login page text
+    'neu bei partslink24',          // Login page promo text
+    'kennwort falsch',              // Login error message
+    'bitte melden sie sich erneut', // Session expired message
   ];
 
   for (const signal of negativeSignals) {
@@ -446,15 +443,40 @@ async function verifyLoginSuccess(page: Page): Promise<boolean> {
     }
   }
 
-  // Check URL for clues
-  const url = page.url().toLowerCase();
-  if (url.includes('login') || url.includes('signin') || url.includes('startup.do')) {
-    logger.warn('URL suggests still on login/startup page');
-    return false;
+  // ── STEP 2: Check POSITIVE signals ──
+  // These are UNIQUE to the dashboard and do NOT appear on the login page
+  const dashboardSignals = [
+    'abmelden',                     // Top nav link — MOST RELIABLE (login page has "Abonnement" not "Abmelden")
+    'herzlich willkommen',          // Dashboard welcome text
+    'verwaltung',                   // Right panel section
+    'händler auswählen',            // Dashboard link
+    'kurzeinstieg',                 // Dashboard quick-start link
+  ];
+
+  for (const signal of dashboardSignals) {
+    if (lower.includes(signal)) {
+      logger.info(`Login verified via: "${signal}"`);
+      return true;
+    }
   }
 
-  logger.warn('Login state unclear — assuming success');
-  return true;
+  // Also check catalog view signals (in case session restored directly to catalog)
+  const catalogSignals = [
+    'fahrzeugidentifikation',       // Catalog left panel
+    'hauptgruppe',                  // Catalog main table
+    'teile suchen',                 // Catalog search input
+  ];
+
+  for (const signal of catalogSignals) {
+    if (lower.includes(signal)) {
+      logger.info(`Login verified via catalog signal: "${signal}"`);
+      return true;
+    }
+  }
+
+  logger.warn('Login state unclear — no positive or negative signals matched');
+  await takeScreenshot(page, 'login-unclear');
+  return false;
 }
 
 async function ensureLoggedIn(page: Page): Promise<boolean> {
