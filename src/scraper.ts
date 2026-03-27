@@ -745,9 +745,24 @@ async function navigateToVehicle(page: Page, vin: string, brand?: string): Promi
       }
     }
 
-    // Wait for SPA to fully render
+    // Wait for SPA to fully render — the URL changes BEFORE React components mount
     if (catalogFound) {
-      await page.waitForTimeout(2000);
+      // Wait for the "Teile suchen" search input to appear (key indicator the SPA is ready)
+      logger.info('SPA URL loaded — waiting for React components to mount...');
+      try {
+        await page.locator('input[placeholder="Teile suchen"]').first().waitFor({ state: 'visible', timeout: 15000 });
+        logger.info('✅ "Teile suchen" input visible — SPA fully rendered');
+      } catch {
+        // Fallback: wait for any catalog signal
+        logger.warn('"Teile suchen" not visible within 15s — checking other signals');
+        try {
+          await page.locator('text=Hauptgruppe').first().waitFor({ state: 'visible', timeout: 10000 });
+          logger.info('✅ "Hauptgruppe" visible — SPA rendered');
+        } catch {
+          logger.warn('SPA render signals not detected — proceeding anyway');
+          await page.waitForTimeout(5000); // Last resort: just wait
+        }
+      }
       await takeScreenshot(page, 'vin-result');
       logger.info('✅ Vehicle identified — catalog loaded', { vin, url: page.url() });
     } else {
