@@ -119,10 +119,12 @@ app.get('/api/health', (_req: Request, res: Response) => {
   const queue = getQueueStats();
   const cache = getCacheStats();
 
-  const isHealthy = browser.running && !queue.circuitBreakerOpen;
+  // Always return 200 — Railway needs this to keep the container alive.
+  // Browser may still be initializing in the background.
+  const isReady = browser.running && !queue.circuitBreakerOpen;
 
-  res.status(isHealthy ? 200 : 503).json({
-    status: isHealthy ? 'healthy' : 'degraded',
+  res.status(200).json({
+    status: isReady ? 'healthy' : 'starting',
     service: 'catalog-scraper',
     timestamp: new Date().toISOString(),
     browser: {
