@@ -243,14 +243,15 @@ async function login(page: Page): Promise<boolean> {
         
         // Method 2: Force-remove the overlay via JS
         if (!dismissed) {
-          await page.evaluate(() => {
-            const uc = document.getElementById('usercentrics-root');
-            if (uc) uc.remove();
-            // Also remove any lingering overlay divs
-            document.querySelectorAll('[class*="overlay"], [class*="consent"], [class*="cookie"]').forEach(el => {
-              if (el instanceof HTMLElement && el.style.position === 'fixed') el.remove();
-            });
-          });
+          await page.evaluate(`
+            (() => {
+              const uc = document.getElementById('usercentrics-root');
+              if (uc) uc.remove();
+              document.querySelectorAll('[class*="overlay"], [class*="consent"], [class*="cookie"]').forEach(el => {
+                if (el.style && el.style.position === 'fixed') el.remove();
+              });
+            })()
+          `);
           logger.info('Cookie consent force-removed via JS');
         }
         
