@@ -569,192 +569,177 @@ async function selectBrand(page: Page, brand: string): Promise<boolean> {
 // ============================================================================
 
 async function navigateToVehicle(page: Page, vin: string, brand?: string): Promise<boolean> {
-  logger.info('Navigating to vehicle...', { vin, brand });
+  logger.info('Navigating to vehicle...', { vin });
 
   try {
-    // PL24 uses a FRAMESET — VIN input + GO button are inside a frame
+    // ── PL24 Dashboard: VIN input is on the MAIN PAGE (not in frames) ──
+    // After login, the dashboard shows a text input with placeholder "Fahrgestellnummer"
+    // next to a "GO" button. This is NOT inside an iframe — it's in the main DOM.
     await page.waitForTimeout(2000);
-    const frames = page.frames();
-    logger.info(`Page has ${frames.length} frames — scanning for VIN/GO...`);
 
-    // Log all frames
-    for (let i = 0; i < frames.length; i++) {
-      try {
-        logger.info(`  Frame ${i}: name="${frames[i].name()}" url="${frames[i].url().substring(0, 100)}"`);
-      } catch { /* ignore */ }
-    }
+    // Log current URL for debugging
+    logger.info(`Current URL: ${page.url()}`);
 
-    // Find the frame containing the GO button (it's a <div class="search-btn">, NOT a <button>)
-    let contentFrame: any = null;
-    for (const frame of frames) {
-      try {
-        // PL24 GO button: <div class="search-btn" onclick="searchText();"><div id="tooltip-go">GO</div></div>
-        const goCount = await frame.locator('div.search-btn, #tooltip-go').count();
-        if (goCount > 0) {
-          contentFrame = frame;
-          logger.info(`✅ Found GO button (div.search-btn) in frame: "${frame.name()}"`);
-          break;
-        }
-      } catch { /* skip */ }
-    }
-
-    // Fallback: frame with VIN input placeholder or brand images
-    if (!contentFrame) {
-      for (const frame of frames) {
-        try {
-          const vinInput = await frame.locator('input[placeholder="Fahrgestellnummer"]').count();
-          if (vinInput > 0) {
-            contentFrame = frame;
-            logger.info(`Found content frame via VIN placeholder: "${frame.name()}"`);
-            break;
-          }
-        } catch { /* skip */ }
-      }
-    }
-
-    // Last fallback: frame with visible text inputs
-    if (!contentFrame) {
-      for (const frame of frames) {
-        try {
-          const count = await frame.locator('input[type="text"]:visible').count();
-          if (count > 0) {
-            contentFrame = frame;
-            logger.info(`Using frame with ${count} inputs: "${frame.name()}"`);
-            break;
-          }
-        } catch { /* skip */ }
-      }
-    }
-
-    if (!contentFrame) {
-      logger.error('No content frame found!');
-      await takeScreenshot(page, 'no-frame');
-      return false;
-    }
-
-    // Find VIN input IN the frame
-    // Exact HTML: <input name="text" type="text" placeholder="Fahrgestellnummer" maxLength="17">
-    let vinField: any = null;
-    const vinSels = [
-      'input[placeholder="Fahrgestellnummer"]',   // EXACT match from DevTools
-      'input[name="text"][maxlength="17"]',        // form field for VIN
-      'input[name*="fahrgestell" i]', 'input[name*="vin" i]',
+    // ── Step 1: Find VIN input on the dashboard ──
+    let vinField: Locator | null = null;
+    const vinSelectors = [
+      'input[placeholder="Fahrgestellnummer"]',     // Exact match from real PL24 dashboard
+      'input[placeholder*="FAHRGESTELL" i]',        // Case-insensitive variant
+      'input[placeholder*="fahrgestell" i]',
+      'input[maxlength="17"][type="text"]',          // VIN length attribute
     ];
-    for (const sel of vinSels) {
+
+    for (const sel of vinSelectors) {
       try {
-        const el = contentFrame.locator(sel).first();
-        if (await el.count() > 0) {
+        const el = page.locator(sel).first();
+        if (await el.count() > 0 && await el.isVisible({ timeout: 3000 })) {
           vinField = el;
           logger.info(`Found VIN field via: ${sel}`);
           break;
         }
-      } catch { /* next */ }
+      } catch { /* try next */ }
     }
 
-    // Fallback: input inside form[name="search-text"]
+    // Fallback: check inside frames (in case PL24 ever switches back to framesets)
     if (!vinField) {
-      try {
-        const formInput = contentFrame.locator('form[name="search-text"] input[type="text"]').first();
-        if (await formInput.count() > 0) { vinField = formInput; logger.info('Found VIN via form[name=search-text]'); }
-      } catch { /* ignore */ }
+      for (const frame of page.frames()) {
+        if (frame === page.mainFrame()) continue;
+        for (const sel of vinSelectors) {
+          try {
+            const el = frame.locator(sel).first();
+            if (await el.count() > 0) {
+              vinField = el;
+              logger.info(`Found VIN field in frame "${frame.name()}": ${sel}`);
+              break;
+            }
+          } catch { /* skip */ }
+        }
+        if (vinField) break;
+      }
     }
 
-    // Fallback: first text input in frame
     if (!vinField) {
-      const inputs = await contentFrame.locator('input[type="text"]:visible').all();
-      if (inputs.length > 0) { vinField = inputs[0]; logger.info(`Using first input in frame (${inputs.length})`); }
+      logger.error('VIN input not found on dashboard!');
+      await takeScreenshot(page, 'vin-not-found');
+      return false;
     }
 
-    if (!vinField) { logger.error('VIN input not found!'); return false; }
+    // ── Step 2: Enter VIN ──
+    await vinField.click();
+    await humanDelay(200, 400);
+    await vinField.fill('');
+    await humanDelay(100, 200);
+    await vinField.type(vin, { delay: 50 });
+    await humanDelay(300, 600);
+    logger.info('VIN entered', { vin });
 
-    // Enter VIN
-    await vinField.click(); await humanDelay(100, 300);
-    await vinField.fill(''); await humanDelay(100, 200);
-    await vinField.type(vin, { delay: 50 }); await humanDelay(300, 600);
-    logger.info('VIN entered');
-
-    // Click GO IN the frame
-    // Exact HTML: <div class="search-btn" onclick="searchText();return false;"><div id="tooltip-go">GO</div></div>
-    // Also: <input id="hidden-search" class="auto-submit" type="submit" onclick="searchText();return false;">
+    // ── Step 3: Click GO button ──
+    // Real PL24 dashboard: the GO button is right next to the VIN input.
+    // It can be an <input type="submit" value="GO">, a <button>, or a <div>.
     let goClicked = false;
-    const goSels = [
-      'div.search-btn',                    // EXACT match — the visible GO div
-      '#tooltip-go',                        // inner GO text div
-      '#hidden-search',                     // hidden submit input
-      'input[type="submit"]',              // generic submit
+    const goSelectors = [
+      'input[type="submit"][value="GO"]',            // Submit button with GO text
+      'input[type="submit"][value="Go"]',
+      'button:has-text("GO")',                       // Button with GO text
+      'div.search-btn',                              // Div-based GO button
+      '#tooltip-go',                                 // GO tooltip div
+      'input[type="submit"]',                        // Generic submit
     ];
-    for (const sel of goSels) {
+
+    for (const sel of goSelectors) {
       try {
-        const btn = contentFrame.locator(sel).first();
-        if (await btn.count() > 0) {
+        const btn = page.locator(sel).first();
+        if (await btn.count() > 0 && await btn.isVisible({ timeout: 2000 })) {
           logger.info(`Clicking GO: ${sel}`);
           await btn.click();
           goClicked = true;
           break;
         }
-      } catch { /* next */ }
+      } catch { /* try next */ }
     }
-    if (!goClicked) { logger.info('GO not found — Enter'); await vinField.press('Enter'); }
 
-    // Wait for catalog in any frame (up to 60s)
-    logger.info('Waiting for catalog...');
-    await page.waitForTimeout(5000);
+    if (!goClicked) {
+      logger.info('GO button not found — submitting via Enter key');
+      await vinField.press('Enter');
+    }
 
-    const signals = ['Hauptgruppe', 'Fahrzeugidentifikation', 'Teile suchen', 'Modellbezeichnung'];
+    // ── Step 4: Wait for SPA navigation to catalog ──
+    // After clicking GO, PL24 navigates to a React SPA:
+    //   https://www.partslink24.com/pl24-app/{brand}_parts/{VIN}/0/vehicle
+    // The URL contains "/pl24-app/" — this is the key signal.
+    logger.info('Waiting for catalog SPA to load...');
+
     let catalogFound = false;
 
-    for (let attempt = 0; attempt < 12; attempt++) {
-      for (const frame of page.frames()) {
-        try {
-          const text = await frame.locator('body').innerText({ timeout: 2000 });
-          for (const sig of signals) {
-            if (text.includes(sig)) {
-              logger.info(`✅ Catalog: "${sig}" in frame "${frame.name()}" (attempt ${attempt + 1})`);
+    // Strategy 1: Wait for URL to change to /pl24-app/ (most reliable)
+    try {
+      await page.waitForURL(/\/pl24-app\//, { timeout: 30000 });
+      logger.info(`✅ SPA URL detected: ${page.url()}`);
+      catalogFound = true;
+    } catch {
+      logger.warn('URL did not change to /pl24-app/ within 30s');
+    }
+
+    // Strategy 2: Wait for catalog UI signals in the DOM
+    if (!catalogFound) {
+      const signals = [
+        'input[placeholder="Teile suchen"]',         // Parts search field in catalog
+        'text=Hauptgruppe',                           // Main category header
+        'text=Fahrzeugidentifikation',                // Vehicle ID panel
+      ];
+
+      for (let attempt = 0; attempt < 10; attempt++) {
+        for (const sig of signals) {
+          try {
+            const el = page.locator(sig).first();
+            if (await el.isVisible({ timeout: 2000 })) {
+              logger.info(`✅ Catalog signal found: "${sig}" (attempt ${attempt + 1})`);
               catalogFound = true;
               break;
             }
-          }
-        } catch { /* skip */ }
+          } catch { /* skip */ }
+        }
         if (catalogFound) break;
+        logger.info(`Catalog not ready (attempt ${attempt + 1}/10)...`);
+        await page.waitForTimeout(3000);
       }
-      if (catalogFound) break;
-      logger.info(`Catalog not ready (attempt ${attempt + 1}/12)...`);
-      await page.waitForTimeout(5000);
     }
 
-    // Debug dump
-    for (const frame of page.frames()) {
-      try {
-        const body = await frame.locator('body').innerText({ timeout: 2000 });
-        logger.info(`Frame "${frame.name()}": ${body.substring(0, 200)}`);
-      } catch { /* skip */ }
-    }
-
+    // Wait for SPA to fully render
     if (catalogFound) {
-      logger.info('✅ Vehicle identified', { vin });
+      await page.waitForTimeout(2000);
+      await takeScreenshot(page, 'vin-result');
+      logger.info('✅ Vehicle identified — catalog loaded', { vin, url: page.url() });
     } else {
       await takeScreenshot(page, 'vin-no-catalog');
-      logger.warn('Catalog not found after GO', { vin });
+      logger.warn('Catalog not found after GO — page may still be on dashboard', { vin, url: page.url() });
+
+      // Debug: dump page content
+      try {
+        const bodyText = await page.locator('body').innerText({ timeout: 5000 });
+        logger.info(`Page body (first 500 chars): ${bodyText.substring(0, 500)}`);
+      } catch { /* ignore */ }
     }
-    return true;
+
+    return catalogFound;
 
   } catch (err: any) {
-    logger.error('Navigate failed', { vin, error: err.message });
+    logger.error('Navigate to vehicle failed', { vin, error: err.message });
     await takeScreenshot(page, 'vin-error');
     return false;
   }
 }
 
 // ============================================================================
-// PART SEARCH — "Teile suchen" input in catalog view top bar
+// PART SEARCH — "Teile suchen" input in the SPA catalog top bar
 //
-// Real PL24 catalog (screenshot 1+2):
-// Top bar: [VIN input] [🔍] | [Teile suchen] [🔍] | [Händler wählen]
-// The "Teile suchen" field is the SECOND text input in the top bar.
+// Real PL24 catalog (verified March 2026):
+// Top bar: [BMW Logo] [VIN input] [🔍] | [Teile suchen] [🔍] | [Händler wählen]
+// The "Teile suchen" field is a React MUI input with placeholder="Teile suchen".
 //
-// After search (screenshot 2):
-// Left panel: "Suche: ölfilter"
-// Results stacked vertically:
+// After search, URL changes to: /pl24-app/{brand}_parts/{VIN}/0/search?q={query}
+// Left sidebar panel shows: "Suche: ölfilter"
+// Results in a scrollable drawer (div._listScrollContainer_*):
 //   Bildtafel    11_9979
 //   Teilenummer  11 42 7 508 966
 //   Benennung    Ölfilter mit Kunststoffdeckel
@@ -766,11 +751,12 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
   logger.info('Searching for part...', { partQuery });
 
   try {
-    // Find "Teile suchen" input
+    // ── Find "Teile suchen" input on the SPA page ──
     let searchField = await findSearchInput(page);
 
     if (!searchField) {
-      logger.error('"Teile suchen" input not found!');
+      logger.error('"Teile suchen" input not found in catalog SPA!');
+      logger.info(`Current URL: ${page.url()}`);
       await takeScreenshot(page, 'search-not-found');
       return [];
     }
@@ -782,13 +768,15 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
     await humanDelay(100, 200);
     await searchField.type(partQuery, { delay: 40 });
     await humanDelay(300, 600);
+    logger.info('Search query entered', { partQuery });
 
-    // Submit search
-    await submitPartSearch(page, searchField);
+    // Submit search (Enter key — most reliable in the SPA)
+    await searchField.press('Enter');
+    logger.info('Search submitted');
 
-    // Wait for search results
+    // Wait for search results to appear
     await waitForSearchResults(page, partQuery);
-    await humanDelay(2000, 4000);
+    await humanDelay(1500, 3000);
 
     // Check for bot detection
     await assertNotBlocked(page, 'part-search');
@@ -796,20 +784,10 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
     // Take debug screenshot
     await takeScreenshot(page, 'search-results');
 
-    // Dump frame content for debugging extraction
-    for (const frame of page.frames()) {
-      try {
-        const bodyText = await frame.locator('body').innerText({ timeout: 3000 });
-        if (bodyText.length > 50) {
-          logger.info(`Frame "${frame.name()}" body (first 400 chars):`, { body: bodyText.substring(0, 400) });
-          if (bodyText.includes('Teilenummer')) {
-            logger.info(`✅ "Teilenummer" found in frame "${frame.name()}" — extraction should work`);
-          }
-        }
-      } catch { /* skip */ }
-    }
+    // Log current URL (should contain ?q=...)
+    logger.info(`Search URL: ${page.url()}`);
 
-    // Extract OEM results
+    // Extract OEM results from the SPA page
     const results = await extractOemResults(page);
     logger.info(`Found ${results.length} OEM results for "${partQuery}"`, {
       results: results.slice(0, 5).map(r => `${r.oem} (${r.description})`),
@@ -825,114 +803,73 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
 }
 
 async function findSearchInput(page: Page): Promise<Locator | null> {
-  // Exact HTML from DevTools: <input placeholder="Teile suchen" type="text" class="MuiInputBase-input...">
-  // Parent: <div id="partSearchInput">
-  // The catalog view loads in a FRAME, so scan all frames
+  // The catalog is a React SPA — "Teile suchen" input is on the MAIN PAGE.
+  // Exact HTML: <input placeholder="Teile suchen" type="text" class="MuiInputBase-input...">
   const selectors = [
-    'input[placeholder="Teile suchen"]',           // EXACT match from DevTools
-    '#partSearchInput input[type="text"]',          // parent container
-    'input[placeholder*="Teile suchen" i]',
-    'input[placeholder*="suchen" i]',
+    'input[placeholder="Teile suchen"]',           // EXACT match from real PL24 catalog SPA
+    '#partSearchInput input[type="text"]',          // Parent container ID
+    'input[placeholder*="Teile" i]',               // Partial match
+    'input[placeholder*="suchen" i]',              // Partial match
   ];
 
-  // Try main page first
+  // Primary: search on the main page (SPA)
   for (const sel of selectors) {
     try {
       const el = page.locator(sel).first();
-      if (await el.count() > 0 && await el.isVisible()) {
-        logger.info(`Found search field on main page: ${sel}`);
+      if (await el.count() > 0 && await el.isVisible({ timeout: 3000 })) {
+        logger.info(`Found search field: ${sel}`);
         return el;
       }
     } catch { /* try next */ }
   }
 
-  // Try ALL frames
-  for (const frame of page.frames()) {
-    for (const sel of selectors) {
-      try {
-        const el = frame.locator(sel).first();
-        if (await el.count() > 0) {
-          logger.info(`Found search field in frame "${frame.name()}": ${sel}`);
-          return el;
-        }
-      } catch { /* try next */ }
+  // Fallback: positional — second visible text input on the page
+  // (first is the VIN field, second is the search field)
+  try {
+    const allInputs = await page.locator('input[type="text"]:visible').all();
+    if (allInputs.length >= 2) {
+      logger.info(`Using positional fallback: second text input (${allInputs.length} total)`);
+      return allInputs[1];
     }
-  }
-
-  // Positional fallback (second visible text input in any frame)
-  for (const frame of page.frames()) {
-    try {
-      const allInputs = await frame.locator('input[type="text"]:visible').all();
-      if (allInputs.length >= 2) {
-        logger.info(`Using second text input in frame "${frame.name()}" (${allInputs.length} total)`);
-        return allInputs[1];
-      }
-    } catch { /* ignore */ }
-  }
+  } catch { /* ignore */ }
 
   return null;
 }
 
-async function submitPartSearch(page: Page, searchField: Locator): Promise<void> {
-  // Try magnifying glass next to search input
-  try {
-    const parent = searchField.locator('..');
-    const icons = await parent.locator('button, a, [role="button"], svg, img').all();
-    for (const icon of icons) {
-      if (await icon.isVisible()) {
-        logger.debug('Clicking search magnifying glass');
-        await icon.click();
-        return;
-      }
-    }
-  } catch { /* fall through */ }
-
-  // Try search button
-  const btnSelectors = [
-    'button:has-text("Suchen")',
-    'input[type="submit"]',
-  ];
-  for (const sel of btnSelectors) {
-    try {
-      const btn = page.locator(sel).first();
-      if (await btn.count() > 0) {
-        await btn.click();
-        return;
-      }
-    } catch { /* try next */ }
-  }
-
-  // Enter key
-  await searchField.press('Enter');
-}
-
 /**
- * Wait for search results to appear.
- * Real PL24 shows "Suche: ölfilter" header and Bildtafel/Teilenummer blocks.
+ * Wait for search results to appear in the SPA sidebar.
+ * Real PL24 shows "Suche: ölfilter" header and Bildtafel/Teilenummer blocks
+ * in a scrollable drawer panel.
  */
 async function waitForSearchResults(page: Page, query: string): Promise<void> {
+  // Strategy 1: Wait for URL to contain search query parameter
+  try {
+    await page.waitForURL(/[?&]q=/, { timeout: 15000 });
+    logger.info('URL contains search query parameter');
+  } catch {
+    logger.debug('URL did not update with search query');
+  }
+
+  // Strategy 2: Wait for result signals in the DOM
   const signals = [
-    `text=Suche: ${query}`,
-    'text=Teilenummer',
-    'text=Bildtafel',
-    'text=Benennung',
+    'text=Teilenummer',                              // Result field label
+    'text=Bildtafel',                                // Result field label
+    'text=Benennung',                                // Result field label
+    `text=Suche:`,                                   // Search header
+    'text=Es wurden keine Einträge',                 // No results message
   ];
 
   for (const signal of signals) {
     try {
-      await page.locator(signal).first().waitFor({ state: 'visible', timeout: 15000 });
-      logger.debug(`Search results loaded — signal: "${signal}"`);
+      await page.locator(signal).first().waitFor({ state: 'visible', timeout: 10000 });
+      logger.info(`Search results loaded — signal: "${signal}"`);
       return;
     } catch { /* try next */ }
   }
 
-  // Fallback
-  try {
-    await page.waitForLoadState('load', { timeout: 20000 });
-  } catch {
-    logger.warn('Search results wait timed out');
-  }
-  await sleep(2000);
+  // Fallback: just wait
+  logger.warn('No search result signals detected — waiting 5s');
+  await sleep(5000);
 }
 
 // ============================================================================
