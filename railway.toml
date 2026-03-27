@@ -1,7 +1,5 @@
 [service]
 name = "oem-detect-service"
-buildCommand = ""
-startCommand = ""
 
 [build]
 builder = "DOCKERFILE"
@@ -11,4 +9,4 @@ dockerfilePath = "./Dockerfile"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
 healthcheckPath = "/api/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 90

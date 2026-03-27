@@ -3,6 +3,9 @@ FROM node:20-slim AS builder
 
 WORKDIR /app
 
+# Skip Playwright browser download (we use system Chromium)
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
 # Install ALL deps (including TypeScript for compilation)
 COPY package*.json ./
 RUN npm ci
@@ -27,16 +30,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Tell Playwright to use system Chromium
-ENV PLAYWRIGHT_BROWSERS_PATH=0
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
-
 WORKDIR /app
 
-# Copy compiled JS + production deps only
+# Skip Playwright browser download in runtime too
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# Tell Playwright to use system Chromium
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+
+# Copy compiled JS only (no dev deps needed)
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY package.json ./
+COPY package*.json ./
+
+# Install production deps only (skip Playwright browser download)
+RUN npm ci --only=production && npm cache clean --force
 
 # Create data directory
 RUN mkdir -p /app/playwright-data
@@ -48,7 +54,7 @@ USER scraper
 
 EXPOSE 4100
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
   CMD node -e "const http=require('http');const r=http.get('http://localhost:4100/api/health',s=>{process.exit(s.statusCode===200?0:1)});r.on('error',()=>process.exit(1))"
 
 ENV NODE_ENV=production

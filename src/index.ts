@@ -35,12 +35,8 @@ async function main() {
   logger.info('Step 1/3: Initializing cache...');
   initCache();
 
-  // Step 2: Launch browser
-  logger.info('Step 2/3: Launching browser...');
-  await initBrowser();
-
-  // Step 3: Start API server
-  logger.info('Step 3/3: Starting API server...');
+  // Step 2: Start API server FIRST (so health check works)
+  logger.info('Step 2/3: Starting API server...');
   app.listen(config.port, () => {
     logger.info(`✅ Catalog Scraper running on http://localhost:${config.port}`);
     logger.info(`   POST /api/lookup              — OEM lookup (VIN + part)`);
@@ -53,6 +49,14 @@ async function main() {
     if (!config.pl24.username) {
       logger.warn('⚠️  PL24_USERNAME not set! Configure .env before making lookups.');
     }
+  });
+
+  // Step 3: Launch browser in background (doesn't block health check)
+  logger.info('Step 3/3: Launching browser (background)...');
+  initBrowser().then(() => {
+    logger.info('✅ Browser ready — accepting lookups');
+  }).catch(err => {
+    logger.error('Browser init failed — lookups will return 503 until browser is ready', { error: err.message });
   });
 
   // Schedule periodic cache cleanup (every 24h)
