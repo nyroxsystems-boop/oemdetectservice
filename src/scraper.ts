@@ -859,33 +859,62 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
 
 async function findSearchInput(page: Page): Promise<Locator | null> {
   // The catalog is a React SPA — "Teile suchen" input is on the MAIN PAGE.
+  // The React components mount asynchronously after URL change, so we must WAIT for them.
   // Exact HTML: <input placeholder="Teile suchen" type="text" class="MuiInputBase-input...">
-  const selectors = [
-    'input[placeholder="Teile suchen"]',           // EXACT match from real PL24 catalog SPA
+
+  // Strategy 1: Wait for the exact selector (most reliable)
+  const primarySelector = 'input[placeholder="Teile suchen"]';
+  try {
+    const el = page.locator(primarySelector).first();
+    await el.waitFor({ state: 'visible', timeout: 20000 });
+    logger.info(`Found search field via waitFor: ${primarySelector}`);
+    return el;
+  } catch {
+    logger.warn(`"${primarySelector}" not visible within 20s`);
+  }
+
+  // Strategy 2: Try alternative selectors with shorter timeout
+  const altSelectors = [
     '#partSearchInput input[type="text"]',          // Parent container ID
     'input[placeholder*="Teile" i]',               // Partial match
     'input[placeholder*="suchen" i]',              // Partial match
+    'input[placeholder*="search" i]',              // English fallback
   ];
 
-  // Primary: search on the main page (SPA)
-  for (const sel of selectors) {
+  for (const sel of altSelectors) {
     try {
       const el = page.locator(sel).first();
       if (await el.count() > 0 && await el.isVisible({ timeout: 3000 })) {
-        logger.info(`Found search field: ${sel}`);
+        logger.info(`Found search field via fallback: ${sel}`);
         return el;
       }
     } catch { /* try next */ }
   }
 
-  // Fallback: positional — second visible text input on the page
-  // (first is the VIN field, second is the search field)
+  // Strategy 3: Positional — find text inputs and use the search one
+  // In the catalog SPA, there are typically 2+ text inputs: VIN display + search
   try {
     const allInputs = await page.locator('input[type="text"]:visible').all();
+    logger.info(`Positional fallback: ${allInputs.length} visible text inputs found`);
     if (allInputs.length >= 2) {
-      logger.info(`Using positional fallback: second text input (${allInputs.length} total)`);
-      return allInputs[1];
+      // The search input is typically the last one or the second one
+      return allInputs[allInputs.length - 1];
     }
+  } catch { /* ignore */ }
+
+  // Debug: log what IS on the page
+  try {
+    const inputs = await page.locator('input').all();
+    const inputInfo = [];
+    for (const inp of inputs.slice(0, 10)) {
+      try {
+        const placeholder = await inp.getAttribute('placeholder');
+        const type = await inp.getAttribute('type');
+        const visible = await inp.isVisible();
+        inputInfo.push({ placeholder, type, visible });
+      } catch { /* skip */ }
+    }
+    logger.info(`All inputs on page: ${JSON.stringify(inputInfo)}`);
   } catch { /* ignore */ }
 
   return null;
