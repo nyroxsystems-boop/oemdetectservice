@@ -604,10 +604,32 @@ export async function crawlSingleBrand(brand: string): Promise<{
               );
               logger.info(`    │ 🔍 Content values (first 30): ${contentValues.slice(0, 30).join(' | ')}`);
 
-              // Try BT pattern first: XXX-YYY (e.g., 010-005)
+              // Try BT pattern: In PL24, Bildtafeln appear as THREE consecutive spans:
+              //   UG (2-digit) | Nummer1 (3-digit) | Nummer2 (3-digit) | Benennung (text)
+              // Example: "21" | "121" | "000" | "Kühlmittelkühlung"
+              // We combine Nummer1+Nummer2 into "121-000" as the Bildtafel ID
               const bildtafeln: Array<{ bt: string; ug: string; name: string }> = [];
+              const seenBt = new Set<string>();
+
+              for (let i = 0; i < btValues.length - 2; i++) {
+                // Pattern: 2-digit UG + 3-digit + 3-digit
+                if (/^\d{2}$/.test(btValues[i]) && /^\d{3}$/.test(btValues[i + 1]) && /^\d{3}$/.test(btValues[i + 2])) {
+                  const ug = btValues[i];
+                  const bt = `${btValues[i + 1]}-${btValues[i + 2]}`;
+                  if (!seenBt.has(bt)) {
+                    seenBt.add(bt);
+                    // Name is the next value after the 3 numbers (if it's text, not another number)
+                    const name = (i + 3 < btValues.length && !/^\d{2,3}$/.test(btValues[i + 3]))
+                      ? btValues[i + 3] : '';
+                    bildtafeln.push({ bt, ug, name });
+                  }
+                }
+              }
+
+              // Also try original XXX-YYY pattern (some brands may use it)
               for (let i = 0; i < btValues.length; i++) {
-                if (/^\d{3}-\d{3}$/.test(btValues[i])) {
+                if (/^\d{3}-\d{3}$/.test(btValues[i]) && !seenBt.has(btValues[i])) {
+                  seenBt.add(btValues[i]);
                   const ug = (i > 0 && /^\d{2}$/.test(btValues[i - 1])) ? btValues[i - 1] : '00';
                   const name = (i + 1 < btValues.length && !/^\d{2,3}/.test(btValues[i + 1])) ? btValues[i + 1] : '';
                   bildtafeln.push({ bt: btValues[i], ug, name });
@@ -630,7 +652,16 @@ export async function crawlSingleBrand(brand: string): Promise<{
                     }
 
                     logger.info(`    │ 🖱 BT ${bi + 1}/${bildtafeln.length}: ${bt.bt} (${bt.name})`);
-                    const btClicked = await clickValueRow(page, bt.bt);
+                    // Bildtafel ID is split across spans (e.g., "121" + "000"), so click by:
+                    // 1. Description text (most unique)
+                    // 2. Second part of BT number
+                    // 3. First part of BT number
+                    const btParts = bt.bt.split('-');
+                    let btClicked = false;
+                    if (bt.name) btClicked = await clickValueRow(page, bt.name);
+                    if (!btClicked && btParts.length === 2) btClicked = await clickValueRow(page, btParts[1]);
+                    if (!btClicked && btParts.length === 2) btClicked = await clickValueRow(page, btParts[0]);
+                    if (!btClicked) btClicked = await clickValueRow(page, bt.bt);
                     if (!btClicked) {
                       logger.warn(`    │ ⚠ Could not click BT ${bt.bt}`);
                       continue;
