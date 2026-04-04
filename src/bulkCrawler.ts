@@ -54,38 +54,42 @@ export function getBulkState() {
 
 /** Read all values from PL24 SPA _value_ spans */
 async function readValueSpans(page: Page): Promise<string[]> {
-  return page.evaluate(() => {
-    const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
-    const values: string[] = [];
-    for (const s of spans) {
-      if (s.children.length === 0) {
-        const t = s.textContent?.trim();
-        if (t && t.length > 0 && t.length < 80) values.push(t);
+  return page.evaluate(`
+    (() => {
+      const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+      const values = [];
+      for (const s of spans) {
+        if (s.children.length === 0) {
+          const t = s.textContent?.trim();
+          if (t && t.length > 0 && t.length < 80) values.push(t);
+        }
       }
-    }
-    return values;
-  });
+      return values;
+    })()
+  `) as Promise<string[]>;
 }
 
 /** Click a value span by exact or partial text match */
 async function clickValueSpan(page: Page, text: string): Promise<boolean> {
-  const clicked = await page.evaluate((searchText) => {
-    const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
-    for (const s of spans) {
-      if (s.children.length === 0 && s.textContent?.trim() === searchText) {
-        (s as HTMLElement).click();
-        return true;
+  const clicked = await page.evaluate(`
+    (() => {
+      const searchText = ${JSON.stringify(text)};
+      const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+      for (const s of spans) {
+        if (s.children.length === 0 && s.textContent?.trim() === searchText) {
+          s.click();
+          return true;
+        }
       }
-    }
-    // Partial match fallback
-    for (const s of spans) {
-      if (s.children.length === 0 && s.textContent?.trim().includes(searchText)) {
-        (s as HTMLElement).click();
-        return true;
+      for (const s of spans) {
+        if (s.children.length === 0 && s.textContent?.trim().includes(searchText)) {
+          s.click();
+          return true;
+        }
       }
-    }
-    return false;
-  }, text);
+      return false;
+    })()
+  `) as Promise<boolean>;
 
   if (clicked) {
     await waitForStable(page);
@@ -96,32 +100,30 @@ async function clickValueSpan(page: Page, text: string): Promise<boolean> {
 
 /** Extract OEM numbers from the current Bildtafel page */
 async function extractOemsFromPage(page: Page): Promise<Array<{ oem: string; description: string }>> {
-  return page.evaluate(() => {
-    const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
-    const values: string[] = [];
-    for (const s of spans) {
-      if (s.children.length === 0) {
-        const t = s.textContent?.trim();
-        if (t) values.push(t);
+  return page.evaluate(`
+    (() => {
+      const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+      const values = [];
+      for (const s of spans) {
+        if (s.children.length === 0) {
+          const t = s.textContent?.trim();
+          if (t) values.push(t);
+        }
       }
-    }
-
-    // OEM pattern: 3 alphanumeric + space + 3 digits + space + 3 digits + optional suffix
-    const oemPattern = /^[A-Z0-9]{3}\s\d{3}\s\d{3}(\s[A-Z0-9]{0,3})?$/;
-    const results: Array<{ oem: string; description: string }> = [];
-    const seen = new Set<string>();
-
-    for (let i = 0; i < values.length; i++) {
-      if (oemPattern.test(values[i]) && !seen.has(values[i])) {
-        seen.add(values[i]);
-        // Description is typically the next value after the OEM
-        const desc = (i + 1 < values.length && !oemPattern.test(values[i + 1]))
-          ? values[i + 1] : '';
-        results.push({ oem: values[i], description: desc });
+      const oemPattern = /^[A-Z0-9]{3}\\s\\d{3}\\s\\d{3}(\\s[A-Z0-9]{0,3})?$/;
+      const results = [];
+      const seen = new Set();
+      for (let i = 0; i < values.length; i++) {
+        if (oemPattern.test(values[i]) && !seen.has(values[i])) {
+          seen.add(values[i]);
+          const desc = (i + 1 < values.length && !oemPattern.test(values[i + 1]))
+            ? values[i + 1] : '';
+          results.push({ oem: values[i], description: desc });
+        }
       }
-    }
-    return results;
-  });
+      return results;
+    })()
+  `) as Promise<Array<{ oem: string; description: string }>>;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -469,19 +471,21 @@ async function scrapeBildtafel(job: BulkJob, node: BulkProgressEntry): Promise<v
       // Click the Bildtafel
       if (node.bildtafel_id) {
         // Click the Bildtafel row — need to find the XXX-YYY span and click its parent row
-        const btClicked = await page.evaluate((btId) => {
-          const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
-          for (const s of spans) {
-            if (s.textContent?.trim() === btId) {
-              // Click the parent row element
-              const row = s.closest('[class*="_row_"], [class*="_line_"], [class*="Row"]') || s.parentElement?.parentElement;
-              if (row) { (row as HTMLElement).click(); return true; }
-              (s as HTMLElement).click();
-              return true;
+        const btClicked = await page.evaluate(`
+          (() => {
+            const btId = ${JSON.stringify(node.bildtafel_id)};
+            const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+            for (const s of spans) {
+              if (s.textContent?.trim() === btId) {
+                const row = s.closest('[class*="_row_"], [class*="_line_"], [class*="Row"]') || s.parentElement?.parentElement;
+                if (row) { row.click(); return true; }
+                s.click();
+                return true;
+              }
             }
-          }
-          return false;
-        }, node.bildtafel_id);
+            return false;
+          })()
+        `) as boolean;
 
         if (!btClicked) {
           // Fallback: try clicking by text
