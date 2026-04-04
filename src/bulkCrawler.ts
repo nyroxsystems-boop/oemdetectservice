@@ -66,12 +66,12 @@ async function readValueSpans(page: Page): Promise<string[]> {
       }
       return values;
     })()
-  `) as Promise<string[]>;
+  `) as any as string[];
 }
 
 /** Click a value span by exact or partial text match */
 async function clickValueSpan(page: Page, text: string): Promise<boolean> {
-  const clicked = await page.evaluate(`
+  const clicked: boolean = await page.evaluate(`
     (() => {
       const searchText = ${JSON.stringify(text)};
       const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
@@ -89,7 +89,7 @@ async function clickValueSpan(page: Page, text: string): Promise<boolean> {
       }
       return false;
     })()
-  `) as Promise<boolean>;
+  `) as any;
 
   if (clicked) {
     await waitForStable(page);
@@ -123,7 +123,7 @@ async function extractOemsFromPage(page: Page): Promise<Array<{ oem: string; des
       }
       return results;
     })()
-  `) as Promise<Array<{ oem: string; description: string }>>;
+  `) as any as Array<{ oem: string; description: string }>;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -485,7 +485,7 @@ async function scrapeBildtafel(job: BulkJob, node: BulkProgressEntry): Promise<v
             }
             return false;
           })()
-        `) as boolean;
+        `) as any as boolean;
 
         if (!btClicked) {
           // Fallback: try clicking by text
