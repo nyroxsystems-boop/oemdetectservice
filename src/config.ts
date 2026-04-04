@@ -27,6 +27,6 @@ export const config = {
   adminToken: process.env.ADMIN_TOKEN || '',
 
   // Bulk scraper — crawl settings
-  bulkDelayMs: parseInt(process.env.BULK_DELAY_MS || '5000', 10), // delay between tree nodes
+  bulkDelayMs: parseInt(process.env.BULK_DELAY_MS || '2000', 10), // delay between tree nodes
   bulkMaxConsecutiveErrors: parseInt(process.env.BULK_MAX_ERRORS || '3', 10),
 };

@@ -468,7 +468,47 @@ export function insertResults(jobId: number, rows: Array<{
   });
   tx();
 
+  // Auto-export to WhatsApp-Bot OEM database (fire-and-forget)
+  if (inserted > 0) {
+    autoExportToOemDb(rows).catch(() => { /* silent — don't block scraping */ });
+  }
+
   return inserted;
+}
+
+/** Push OEMs to WhatsApp-Bot OEM database automatically */
+async function autoExportToOemDb(rows: Array<{
+  oem: string; brand: string; model: string; description?: string;
+  hg_code?: string; hg_name?: string; fg_code?: string; fg_name?: string;
+}>): Promise<void> {
+  const { config } = require('./config');
+  const wwsUrl = config.wwsBotUrl;
+  const token = config.adminToken;
+
+  if (!wwsUrl || wwsUrl === 'http://localhost:3000') return; // Not configured
+  if (!token) return;
+
+  const HG_CATEGORY_MAP: Record<string, string> = {
+    '1': 'engine', '2': 'fuel', '3': 'transmission', '4': 'steering',
+    '5': 'suspension', '6': 'brake', '7': 'clutch', '8': 'body',
+    '9': 'electrical', '0': 'accessories',
+  };
+
+  const records = rows.map(r => ({
+    oem: r.oem,
+    brand: r.brand,
+    model: r.model,
+    description: r.description,
+    part_category: HG_CATEGORY_MAP[r.hg_code || ''] || r.hg_name?.toLowerCase() || 'other',
+  }));
+
+  try {
+    await fetch(`${wwsUrl}/api/admin/oem-database/bulk-import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Token ${token}` },
+      body: JSON.stringify({ records, source: 'partslink24-bulk-auto' }),
+    });
+  } catch { /* silent */ }
 }
 
 export function getResults(jobId: number, opts?: {

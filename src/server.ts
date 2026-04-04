@@ -428,8 +428,13 @@ app.post('/api/bulk/export', async (req: Request, res: Response) => {
   try {
     const results = getAllResultsForExport(jobIds);
     if (results.length === 0) {
-      return res.status(400).json({ error: 'No results to export' });
+      return res.status(400).json({ error: 'No results to export. Make sure the scraper has found OEMs first.' });
     }
+
+    logger.info(`Export: ${results.length} OEMs to export`, {
+      wwsBotUrl: config.wwsBotUrl,
+      hasToken: !!config.adminToken,
+    });
 
     // Map PL24 HG codes to part categories
     const records = results.map(r => ({

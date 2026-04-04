@@ -103,7 +103,7 @@ async function clickValueRow(page: Page, text: string): Promise<boolean> {
 
   if (clicked) {
     await waitForStable(page);
-    await humanDelay(2000, 3500);
+    await humanDelay(1000, 2000);
   }
   return clicked;
 }
@@ -259,14 +259,14 @@ async function goBack(page: Page, label: string): Promise<boolean> {
   if (crumbClicked) {
     logger.info(`  ← Breadcrumb back (${label})`);
     await waitForStable(page);
-    await humanDelay(2000, 3000);
+    await humanDelay(1000, 2000);
     return true;
   }
 
   try {
     await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 });
     logger.info(`  ← Browser back (${label})`);
-    await humanDelay(2000, 3000);
+    await humanDelay(1000, 2000);
     return true;
   } catch {
     logger.warn(`  ⚠ Could not go back (${label})`);
@@ -306,7 +306,7 @@ export async function discoverBrandsAndModels(): Promise<{
       if (page) { try { await page.close(); } catch {} page = null; }
       if (retries > 2) throw new Error(`Login failed after 3 attempts`);
       resetLoginState();
-      await humanDelay(3000, 6000);
+      await humanDelay(1500, 3000);
     }
   }
   if (!page) throw new Error('No page after login');
@@ -329,7 +329,7 @@ export async function discoverBrandsAndModels(): Promise<{
       try {
         const spaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/0?desktop=true&lang=de`;
         await page.goto(spaUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await humanDelay(3000, 5000);
+        await humanDelay(800, 1500);
         await assertNotBlocked(page, `discover-${brandKey}`);
 
         const values = await logPageState(page, `Discover ${brandKey}`);
@@ -430,7 +430,7 @@ export async function crawlSingleBrand(brand: string): Promise<{
     const spaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/0?desktop=true&lang=de`;
     logger.info(`🌐 Navigating to: ${spaUrl}`);
     await page.goto(spaUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await humanDelay(3000, 5000);
+    await humanDelay(800, 1500);
     await assertNotBlocked(page, `brand-${brand}`);
 
     // ── Step 3: Read model list ──
@@ -464,7 +464,7 @@ export async function crawlSingleBrand(brand: string): Promise<{
         if (mi > 0) {
           logger.info('  ↩ Navigating back to model list...');
           await page.goto(spaUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await humanDelay(3000, 5000);
+          await humanDelay(800, 1500);
         }
 
         // Click model
@@ -557,7 +557,7 @@ export async function crawlSingleBrand(brand: string): Promise<{
             if (hi > 0) {
               // Go back to HG page
               await page.goto(hgPageUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-              await humanDelay(2000, 3000);
+              await humanDelay(1000, 2000);
             }
 
             // Click using FULL text (e.g., "1  Motor") — not just the name ("Motor")
@@ -584,7 +584,7 @@ export async function crawlSingleBrand(brand: string): Promise<{
             const postHgUrl = page.url();
             if (postHgUrl === hgPageUrl) {
               logger.warn(`    │ ⚠ URL did not change after HG click — click may not have navigated`);
-              await humanDelay(2000, 3000);
+              await humanDelay(1000, 2000);
             }
 
             const btValues = await logPageState(page, `HG ${hg.code} ${hg.name}`);
@@ -648,7 +648,7 @@ export async function crawlSingleBrand(brand: string): Promise<{
                   try {
                     if (bi > 0) {
                       await page.goto(btPageUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-                      await humanDelay(2000, 3000);
+                      await humanDelay(1000, 1500);
                     }
 
                     logger.info(`    │ 🖱 BT ${bi + 1}/${bildtafeln.length}: ${bt.bt} (${bt.name})`);
@@ -733,7 +733,7 @@ export async function crawlSingleBrand(brand: string): Promise<{
                   try {
                     if (ui > 0) {
                       await page.goto(subGroupUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-                      await humanDelay(1500, 2500);
+                      await humanDelay(800, 1500);
                     }
 
                     logger.info(`    │ 🖱 UG ${ui + 1}/${ugEntries.length}: ${ug.code} ${ug.name}`);
@@ -747,7 +747,7 @@ export async function crawlSingleBrand(brand: string): Promise<{
                       continue;
                     }
 
-                    await humanDelay(2000, 3000);
+                    await humanDelay(1000, 2000);
 
                     // Check what page we're on after clicking UG
                     const ugLevel = detectPageLevel([], page.url());
