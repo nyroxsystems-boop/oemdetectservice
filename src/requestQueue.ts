@@ -15,6 +15,7 @@ interface QueueItem<T> {
   reject: (reason: any) => void;
   label: string;
   addedAt: number;
+  priority: 'high' | 'low';
 }
 
 export interface QueueStats {
@@ -88,7 +89,7 @@ let isProcessing = false;
  * Add a job to the serialized queue.
  * Only ONE job runs at a time — Playwright is NOT thread-safe.
  */
-export function enqueue<T>(fn: () => Promise<T>, label: string): Promise<T> {
+export function enqueue<T>(fn: () => Promise<T>, label: string, priority: 'high' | 'low' = 'high'): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     // Check circuit breaker BEFORE queuing
     if (isCircuitOpen()) {
@@ -102,10 +103,21 @@ export function enqueue<T>(fn: () => Promise<T>, label: string): Promise<T> {
       return;
     }
 
-    queue.push({ fn, resolve, reject, label, addedAt: Date.now() });
-    logger.debug(`Queued job: "${label}" (queue size: ${queue.length})`);
+    queue.push({ fn, resolve, reject, label, addedAt: Date.now(), priority });
+
+    // Sort: high-priority items first, FIFO within same priority
+    queue.sort((a, b) => {
+      if (a.priority !== b.priority) return a.priority === 'high' ? -1 : 1;
+      return a.addedAt - b.addedAt;
+    });
+
+    logger.debug(`Queued job: "${label}" [${priority}] (queue size: ${queue.length})`);
     processNext();
   });
+}
+
+export function getQueueDepth(): number {
+  return queue.length;
 }
 
 async function processNext(): Promise<void> {

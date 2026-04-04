@@ -14,6 +14,13 @@ import { getCached, setCache, getCacheStats, cleanupExpired } from './cache';
 import { getQueueStats, resetCircuitBreaker } from './requestQueue';
 import { logger } from './logger';
 import { config } from './config';
+import {
+  listVehicles, getVehicle, upsertVehicle, updateVehicle, deleteVehicle,
+  createJob, getJob, getActiveJob, listJobs, updateJobStatus,
+  getResults, getAllResultsForExport, getBulkStats, getJobProgress,
+} from './bulkStore';
+import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState } from './bulkCrawler';
+import { seedAllVins, getVinCount } from './vinSeeder';
 
 const app = express();
 app.use(express.json());
@@ -190,5 +197,271 @@ app.post('/api/cache/cleanup', (_req: Request, res: Response) => {
     deletedEntries: deletedCount,
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BULK SCRAPER API
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── GET /api/bulk/status ────────────────────────────────────────────────────
+
+app.get('/api/bulk/status', (_req: Request, res: Response) => {
+  const state = getBulkState();
+  const stats = getBulkStats();
+  const active = getActiveJob();
+
+  res.json({
+    running: state.running,
+    paused: state.paused,
+    currentJob: active || null,
+    ...stats,
+  });
+});
+
+// ── Vehicle CRUD ────────────────────────────────────────────────────────────
+
+app.get('/api/bulk/vehicles', (req: Request, res: Response) => {
+  const brand = req.query.brand as string | undefined;
+  const active = req.query.active !== undefined ? req.query.active === 'true' : undefined;
+  const vehicles = listVehicles({ brand, active });
+  res.json({ vehicles });
+});
+
+app.post('/api/bulk/vehicles', (req: Request, res: Response) => {
+  const { vin, brand, model, model_code, year_from, year_to, notes } = req.body;
+  if (!vin || !brand || !model) {
+    return res.status(400).json({ error: 'Missing required: vin, brand, model' });
+  }
+  try {
+    const id = upsertVehicle({ vin, brand, model, model_code, year_from, year_to, notes });
+    res.json({ success: true, id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/bulk/vehicles/:id', (req: Request, res: Response) => {
+  const id = parseInt(req.params.id);
+  const updated = updateVehicle(id, req.body);
+  if (!updated) return res.status(404).json({ error: 'Vehicle not found' });
+  res.json({ success: true });
+});
+
+app.post('/api/bulk/vehicles/seed', (_req: Request, res: Response) => {
+  try {
+    const result = seedAllVins();
+    res.json({
+      success: true,
+      ...result,
+      availableVins: getVinCount(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/bulk/vehicles/:id', (req: Request, res: Response) => {
+  const id = parseInt(req.params.id);
+  const deleted = deleteVehicle(id);
+  if (!deleted) return res.status(404).json({ error: 'Vehicle not found' });
+  res.json({ success: true });
+});
+
+// ── Job Control ─────────────────────────────────────────────────────────────
+
+app.post('/api/bulk/jobs/start', async (req: Request, res: Response) => {
+  const { vehicleId } = req.body;
+  if (!vehicleId) return res.status(400).json({ error: 'vehicleId required' });
+
+  const vehicle = getVehicle(vehicleId);
+  if (!vehicle) return res.status(404).json({ error: 'Vehicle not found' });
+
+  try {
+    const job = createJob(vehicleId);
+    startCrawl(job.id).catch(err => {
+      logger.error('Crawl failed', { jobId: job.id, error: err.message });
+    });
+    res.json({ success: true, jobId: job.id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/bulk/jobs/start-all', async (_req: Request, res: Response) => {
+  const vehicles = listVehicles({ active: true });
+  if (vehicles.length === 0) {
+    return res.status(400).json({ error: 'No active vehicles' });
+  }
+
+  const jobs: number[] = [];
+  for (const v of vehicles) {
+    try {
+      const job = createJob(v.id);
+      jobs.push(job.id);
+    } catch (err: any) {
+      logger.warn(`Failed to create job for vehicle ${v.id}`, { error: err.message });
+    }
+  }
+
+  // Start first job, rest will be queued
+  if (jobs.length > 0) {
+    startCrawl(jobs[0]).catch(err => {
+      logger.error('First crawl failed', { error: err.message });
+    });
+    // Queue the rest
+    for (let i = 1; i < jobs.length; i++) {
+      updateJobStatus(jobs[i], 'queued');
+    }
+  }
+
+  res.json({ success: true, queued: jobs.length });
+});
+
+app.post('/api/bulk/jobs/:id/pause', (req: Request, res: Response) => {
+  const id = parseInt(req.params.id);
+  const job = getJob(id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  pauseBulk();
+  res.json({ success: true });
+});
+
+app.post('/api/bulk/jobs/:id/resume', async (req: Request, res: Response) => {
+  const id = parseInt(req.params.id);
+  const job = getJob(id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status !== 'paused') return res.status(400).json({ error: 'Job is not paused' });
+
+  resumeBulk();
+  startCrawl(id).catch(err => {
+    logger.error('Resume crawl failed', { jobId: id, error: err.message });
+  });
+  res.json({ success: true });
+});
+
+app.post('/api/bulk/jobs/:id/cancel', (req: Request, res: Response) => {
+  const id = parseInt(req.params.id);
+  const job = getJob(id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  cancelBulk();
+  updateJobStatus(id, 'failed', { last_error: 'Cancelled by admin' });
+  res.json({ success: true });
+});
+
+// ── Job Details ──────────────────────────────────────────────────────────────
+
+app.get('/api/bulk/jobs', (req: Request, res: Response) => {
+  const status = req.query.status as string | undefined;
+  const limit = parseInt(req.query.limit as string || '50');
+  const offset = parseInt(req.query.offset as string || '0');
+  const result = listJobs({ status, limit, offset });
+  res.json(result);
+});
+
+app.get('/api/bulk/jobs/:id', (req: Request, res: Response) => {
+  const id = parseInt(req.params.id);
+  const job = getJob(id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  const progress = getJobProgress(id);
+  res.json({ job, progress });
+});
+
+app.get('/api/bulk/jobs/:id/results', (req: Request, res: Response) => {
+  const id = parseInt(req.params.id);
+  const limit = parseInt(req.query.limit as string || '50');
+  const offset = parseInt(req.query.offset as string || '0');
+  const search = req.query.search as string | undefined;
+  const brand = req.query.brand as string | undefined;
+
+  const result = getResults(id, { limit, offset, search, brand });
+  res.json(result);
+});
+
+// ── Export ───────────────────────────────────────────────────────────────────
+
+app.post('/api/bulk/export', async (req: Request, res: Response) => {
+  const { jobIds } = req.body;
+
+  try {
+    const results = getAllResultsForExport(jobIds);
+    if (results.length === 0) {
+      return res.status(400).json({ error: 'No results to export' });
+    }
+
+    // Map PL24 HG codes to part categories
+    const records = results.map(r => ({
+      oem: r.oem,
+      brand: r.brand,
+      model: r.model,
+      description: r.description,
+      hg_code: r.hg_code,
+      hg_name: r.hg_name,
+      fg_code: r.fg_code,
+      fg_name: r.fg_name,
+      part_category: mapHgToCategory(r.hg_code || '', r.hg_name || ''),
+    }));
+
+    // Push to WhatsApp-Bot in batches
+    const batchSize = 500;
+    let exported = 0;
+    let errors = 0;
+
+    for (let i = 0; i < records.length; i += batchSize) {
+      const batch = records.slice(i, i + batchSize);
+      try {
+        const resp = await fetch(`${config.wwsBotUrl}/api/admin/oem-database/bulk-import`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Token ${config.adminToken}`,
+          },
+          body: JSON.stringify({ records: batch, source: 'partslink24-bulk' }),
+        });
+
+        if (resp.ok) {
+          const data = await resp.json() as any;
+          exported += data.imported || batch.length;
+        } else {
+          errors += batch.length;
+          logger.error(`Export batch failed: ${resp.status}`, { batch: i / batchSize });
+        }
+      } catch (err: any) {
+        errors += batch.length;
+        logger.error('Export batch error', { error: err.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      total: records.length,
+      exported,
+      errors,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── HG Code → Category Mapping ──────────────────────────────────────────────
+
+function mapHgToCategory(hgCode: string, hgName: string): string {
+  const map: Record<string, string> = {
+    '01': 'maintenance', '02': 'maintenance',
+    '03': 'body', '04': 'body',
+    '11': 'engine', '12': 'electrical', '13': 'fuel',
+    '16': 'fuel', '17': 'cooling', '18': 'exhaust',
+    '21': 'clutch', '22': 'transmission', '23': 'transmission',
+    '25': 'drivetrain', '26': 'drivetrain',
+    '31': 'suspension', '32': 'steering', '33': 'suspension',
+    '34': 'brake', '35': 'wheels', '36': 'wheels',
+    '41': 'body', '51': 'body', '52': 'interior',
+    '54': 'glass', '61': 'electrical', '62': 'electrical',
+    '63': 'lighting', '64': 'hvac', '65': 'electronics',
+    '66': 'electronics', '71': 'interior', '72': 'interior',
+    '84': 'communication', '88': 'accessories',
+  };
+  return map[hgCode] || hgName?.toLowerCase() || 'other';
+}
 
 export { app };

@@ -15,6 +15,7 @@
 import { config } from './config';
 import { logger } from './logger';
 import { initCache, cleanupExpired } from './cache';
+import { initBulkStore, recoverRunningJobs } from './bulkStore';
 import { initBrowser, closeBrowser } from './scraper';
 import { app } from './server';
 import fs from 'fs';
@@ -31,9 +32,11 @@ async function main() {
     fs.mkdirSync(dataDir, { recursive: true });
   }
 
-  // Step 1: Initialize cache
-  logger.info('Step 1/3: Initializing cache...');
+  // Step 1: Initialize databases
+  logger.info('Step 1/3: Initializing databases...');
   initCache();
+  initBulkStore();
+  recoverRunningJobs();
 
   // Step 2: Start API server FIRST (so health check works)
   logger.info('Step 2/3: Starting API server...');
@@ -44,6 +47,9 @@ async function main() {
     logger.info(`   GET  /api/cache/stats          — Cache stats`);
     logger.info(`   POST /api/cache/cleanup        — Clean expired cache entries`);
     logger.info(`   POST /api/circuit-breaker/reset — Reset circuit breaker`);
+    logger.info(`   GET  /api/bulk/status            — Bulk scraper status`);
+    logger.info(`   GET  /api/bulk/vehicles           — List vehicles`);
+    logger.info(`   POST /api/bulk/jobs/start         — Start bulk job`);
     logger.info('');
     logger.info(`Config: headless=${config.headless}, delay=${config.requestDelayMs}ms, cacheTTL=${config.cacheTtlSeconds}s`);
     if (!config.pl24.username) {

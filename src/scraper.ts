@@ -126,6 +126,10 @@ export function getBrowserStatus(): { running: boolean; loggedIn: boolean; lastS
   };
 }
 
+export function getContext(): BrowserContext | null {
+  return context;
+}
+
 // ============================================================================
 // BOT DETECTION — Check for CAPTCHAs, blocks, session timeouts
 // ============================================================================
@@ -174,7 +178,7 @@ async function checkForBotDetection(page: Page): Promise<{ blocked: boolean; rea
   }
 }
 
-async function assertNotBlocked(page: Page, ctx: string): Promise<void> {
+export async function assertNotBlocked(page: Page, ctx: string): Promise<void> {
   const check = await checkForBotDetection(page);
   if (check.blocked) {
     logger.error(`⛔ Bot detection during: ${ctx}`, { reason: check.reason });
@@ -497,7 +501,7 @@ async function verifyLoginSuccess(page: Page): Promise<boolean> {
   return false;
 }
 
-async function ensureLoggedIn(page: Page): Promise<boolean> {
+export async function ensureLoggedIn(page: Page): Promise<boolean> {
   if (isLoggedIn) {
     try {
       await page.goto(config.pl24.baseUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT });
@@ -608,7 +612,7 @@ async function selectBrand(page: Page, brand: string): Promise<boolean> {
 // CATALOG VIEW (screenshot 1): VIN already in top-left input, re-entry possible
 // ============================================================================
 
-async function navigateToVehicle(page: Page, vin: string, brand?: string): Promise<boolean> {
+export async function navigateToVehicle(page: Page, vin: string, brand?: string): Promise<boolean> {
   logger.info('Navigating to vehicle...', { vin });
 
   try {
@@ -1001,7 +1005,7 @@ async function extractOemResults(page: Page): Promise<OemResult[]> {
   }
 }
 
-function extractFromText(text: string): OemResult[] {
+export function extractFromText(text: string): OemResult[] {
   const results: OemResult[] = [];
 
   // Strategy 1: Split by "Bildtafel" boundaries (each result block starts with Bildtafel)
@@ -1207,16 +1211,16 @@ async function lookupOemInternal(req: LookupRequest): Promise<LookupResponse> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function sleep(ms: number): Promise<void> {
+export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function humanDelay(minMs: number, maxMs: number): Promise<void> {
+export function humanDelay(minMs: number, maxMs: number): Promise<void> {
   const ms = minMs + Math.random() * (maxMs - minMs);
   return sleep(ms);
 }
 
-async function waitForStable(page: Page, timeout: number = NAVIGATION_TIMEOUT): Promise<void> {
+export async function waitForStable(page: Page, timeout: number = NAVIGATION_TIMEOUT): Promise<void> {
   try {
     await page.waitForLoadState('load', { timeout });
   } catch {
