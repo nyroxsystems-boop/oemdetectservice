@@ -141,15 +141,16 @@ export function initBulkStore(): void {
       job_id INTEGER NOT NULL REFERENCES bulk_jobs(id),
       hg_code TEXT NOT NULL,
       hg_name TEXT,
-      fg_code TEXT,
+      fg_code TEXT DEFAULT '',
       fg_name TEXT,
-      bildtafel_id TEXT,
+      bildtafel_id TEXT DEFAULT '',
       status TEXT NOT NULL DEFAULT 'pending',
       parts_found INTEGER DEFAULT 0,
       error TEXT,
-      completed_at TEXT,
-      UNIQUE(job_id, hg_code, COALESCE(fg_code,''), COALESCE(bildtafel_id,''))
+      completed_at TEXT
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_progress_unique
+      ON bulk_progress(job_id, hg_code, COALESCE(fg_code,''), COALESCE(bildtafel_id,''));
     CREATE INDEX IF NOT EXISTS idx_progress_job ON bulk_progress(job_id);
     CREATE INDEX IF NOT EXISTS idx_progress_status ON bulk_progress(job_id, status);
 
@@ -163,13 +164,14 @@ export function initBulkStore(): void {
       oem TEXT NOT NULL,
       description TEXT,
       bildtafel TEXT,
-      hg_code TEXT,
+      hg_code TEXT DEFAULT '',
       hg_name TEXT,
-      fg_code TEXT,
+      fg_code TEXT DEFAULT '',
       fg_name TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(job_id, oem, COALESCE(hg_code,''), COALESCE(fg_code,''))
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_results_unique
+      ON bulk_results(job_id, oem, COALESCE(hg_code,''), COALESCE(fg_code,''));
     CREATE INDEX IF NOT EXISTS idx_results_job ON bulk_results(job_id);
     CREATE INDEX IF NOT EXISTS idx_results_oem ON bulk_results(oem);
     CREATE INDEX IF NOT EXISTS idx_results_brand ON bulk_results(brand);
