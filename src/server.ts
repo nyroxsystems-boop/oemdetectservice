@@ -20,6 +20,7 @@ import {
   getResults, getAllResultsForExport, getBulkStats, getJobProgress,
 } from './bulkStore';
 import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState, discoverBrandsAndModels, crawlSingleBrand } from './bulkCrawler';
+import { PL24_SERVICE_MAP } from './scraper';
 import { seedAllVins, getVinCount } from './vinSeeder';
 
 const app = express();
@@ -258,6 +259,13 @@ app.post('/api/bulk/discover', async (_req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── GET /api/bulk/brands — List all available brands ──────────────────────────
+
+app.get('/api/bulk/brands', (_req: Request, res: Response) => {
+  const brands = Object.keys(PL24_SERVICE_MAP).sort();
+  res.json({ brands });
 });
 
 // ── POST /api/bulk/crawl-brand — Crawl a single brand completely ─────────────
