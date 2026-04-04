@@ -119,24 +119,55 @@ async function logPageState(page: Page, context: string): Promise<string[]> {
 }
 
 /**
- * Detect what "level" the page is at in the PL24 SPA hierarchy:
- * - 'models': Model list (e.g., "Golf", "Passat", "Polo")
- * - 'years': Year selection (e.g., "2020", "2021", "2022")
- * - 'restrictions': Restriction/engine selection
- * - 'hg': Hauptgruppe (HG) page — single-digit codes with names
- * - 'bildtafeln': Bildtafel list (XXX-YYY format)
- * - 'parts': Parts page with OEM numbers
- * - 'unknown': Can't determine
+ * Detect what "level" the page is at in the PL24 SPA hierarchy.
+ * PRIMARY: Use URL patterns (most reliable in SPA where sidebar shows all levels)
+ * FALLBACK: Content analysis
  */
-function detectPageLevel(values: string[]): string {
-  // Check for HG page: single-digit codes followed by name
-  const hgPattern = /^\d\s+.+/;
-  const hgMatches = values.filter(v => hgPattern.test(v));
-  if (hgMatches.length >= 3) return 'hg';
+function detectPageLevel(values: string[], url?: string): string {
+  // ── PRIMARY: URL-based detection ──
+  if (url) {
+    // Decode URL to check widget IDs encoded in base64 path
+    const decodedUrl = decodeURIComponent(url).toLowerCase();
+    
+    // subGroupsIllusTable = Bildtafeln/Subgroups page (after clicking an HG)
+    if (decodedUrl.includes('subgroupsillustable') || decodedUrl.includes('subgroups')) {
+      return 'bildtafeln';
+    }
+    // mainGroupsTable = Hauptgruppen page
+    if (decodedUrl.includes('maingroupstable')) {
+      return 'hg';
+    }
+    // restrictionTable = Restriction/engine selection
+    if (decodedUrl.includes('restrictiontable')) {
+      return 'restrictions';
+    }
+    // modelYearTable = Year selection
+    if (decodedUrl.includes('modelyeartable')) {
+      return 'years';
+    }
+    // engineTable = Engine selection (Jaguar/Land Rover)
+    if (decodedUrl.includes('enginetable')) {
+      return 'restrictions';
+    }
+    // categoryTypesTable = Category selection (MAN)
+    if (decodedUrl.includes('categorytypestable')) {
+      return 'models';
+    }
+    // partDetailsTable = Parts page
+    if (decodedUrl.includes('partdetailstable') || decodedUrl.includes('partinfo')) {
+      return 'parts';
+    }
+  }
 
+  // ── FALLBACK: Content-based detection ──
   // Check for Bildtafeln: XXX-YYY format
   const btMatches = values.filter(v => /^\d{3}-\d{3}$/.test(v));
   if (btMatches.length >= 2) return 'bildtafeln';
+
+  // Check for HG page: single-digit codes followed by name ("1  Motor")
+  const hgPattern = /^\d\s+.+/;
+  const hgMatches = values.filter(v => hgPattern.test(v));
+  if (hgMatches.length >= 3) return 'hg';
 
   // Check for years: 4-digit numbers
   const yearMatches = values.filter(v => /^\d{4}$/.test(v));
@@ -145,11 +176,6 @@ function detectPageLevel(values: string[]): string {
   // Check for OEM numbers
   const oemMatches = values.filter(v => /^[A-Z0-9]{2,4}[\s.-]\d{3}[\s.-]\d{3}/.test(v));
   if (oemMatches.length >= 2) return 'parts';
-
-  // Check for known HG names
-  const knownHg = ['Motor', 'Kraftstoff', 'Getriebe', 'Karosserie', 'Elektrik', 'Räder', 'Hebelwerk', 'Zubehör'];
-  const hgNameMatches = values.filter(v => knownHg.some(h => v.includes(h)));
-  if (hgNameMatches.length >= 3) return 'hg';
 
   // If values are mostly multi-word strings > 5 chars, likely models
   const modelLike = values.filter(v => v.length > 4 && !/^\d+$/.test(v));
@@ -444,8 +470,8 @@ export async function crawlSingleBrand(brand: string): Promise<{
 
         // Check what page we landed on
         let values = await logPageState(page, `After click "${model}"`);
-        let level = detectPageLevel(values);
-        logger.info(`  📍 Page level: ${level}`);
+        let level = detectPageLevel(values, page.url());
+        logger.info(`  📍 Page level: ${level} (URL-based)`);
 
         // ── Drill down through levels until we reach HG ──
         let maxDrillDown = 5;
@@ -459,8 +485,8 @@ export async function crawlSingleBrand(brand: string): Promise<{
               logger.info(`  📅 Selecting year: ${years[0]} (from ${years.length} available)`);
               await clickValueRow(page, years[0]);
               values = await logPageState(page, `After year ${years[0]}`);
-              level = detectPageLevel(values);
-              logger.info(`  📍 Page level: ${level}`);
+              level = detectPageLevel(values, page.url());
+              logger.info(`  📍 Page level: ${level} (URL-based)`);
             } else {
               break;
             }
@@ -475,8 +501,8 @@ export async function crawlSingleBrand(brand: string): Promise<{
               logger.info(`  🔽 Drill-down: clicking first option: "${options[0]}" (${options.length} available)`);
               await clickValueRow(page, options[0]);
               values = await logPageState(page, `After drill-down "${options[0]}"`);
-              level = detectPageLevel(values);
-              logger.info(`  📍 Page level: ${level}`);
+              level = detectPageLevel(values, page.url());
+              logger.info(`  📍 Page level: ${level} (URL-based)`);
             } else {
               logger.warn(`  ⚠ No drill-down options found — giving up on ${model}`);
               break;
@@ -528,7 +554,8 @@ export async function crawlSingleBrand(brand: string): Promise<{
             }
 
             const btValues = await logPageState(page, `HG ${hg.code} ${hg.name}`);
-            const btLevel = detectPageLevel(btValues);
+            const btLevel = detectPageLevel(btValues, page.url());
+            logger.info(`    │ 📍 Post-HG level: ${btLevel} (URL-based)`);
 
             if (btLevel === 'bildtafeln') {
               // ── Extract Bildtafeln ──
