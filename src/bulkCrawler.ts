@@ -592,7 +592,19 @@ export async function crawlSingleBrand(brand: string): Promise<{
             logger.info(`    │ 📍 Post-HG level: ${btLevel} (URL-based)`);
 
             if (btLevel === 'bildtafeln') {
-              // ── Extract Bildtafeln ──
+              // ── Parse subgroup entries from the page ──
+              // PL24 subGroupsIllusTable shows Untergruppen (UG) with 2-digit codes
+              // AND/OR Bildtafeln (BT) with XXX-YYY format
+              
+              // Debug: Log non-sidebar values to understand format
+              const contentValues = btValues.filter(v =>
+                !/^\d\s+.+/.test(v) &&  // not HG entries
+                !/^(Kataloginformationen|V|Seiten|MSP|Alle Gruppen)/.test(v) &&
+                v.length > 0
+              );
+              logger.info(`    │ 🔍 Content values (first 30): ${contentValues.slice(0, 30).join(' | ')}`);
+
+              // Try BT pattern first: XXX-YYY (e.g., 010-005)
               const bildtafeln: Array<{ bt: string; ug: string; name: string }> = [];
               for (let i = 0; i < btValues.length; i++) {
                 if (/^\d{3}-\d{3}$/.test(btValues[i])) {
@@ -602,74 +614,152 @@ export async function crawlSingleBrand(brand: string): Promise<{
                 }
               }
 
-              logger.info(`    │ 📄 ${bildtafeln.length} Bildtafeln found`);
-              const btPageUrl = page.url();
+              if (bildtafeln.length > 0) {
+                // ── Original BT scraping ──
+                logger.info(`    │ 📄 ${bildtafeln.length} Bildtafeln found (XXX-YYY format)`);
+                const btPageUrl = page.url();
 
-              // ── Scrape each Bildtafel ──
-              for (let bi = 0; bi < bildtafeln.length; bi++) {
-                const bt = bildtafeln[bi];
-                if (bulkPaused) break;
+                for (let bi = 0; bi < bildtafeln.length; bi++) {
+                  const bt = bildtafeln[bi];
+                  if (bulkPaused) break;
 
-                try {
-                  if (bi > 0) {
-                    await page.goto(btPageUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-                    await humanDelay(2000, 3000);
+                  try {
+                    if (bi > 0) {
+                      await page.goto(btPageUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+                      await humanDelay(2000, 3000);
+                    }
+
+                    logger.info(`    │ 🖱 BT ${bi + 1}/${bildtafeln.length}: ${bt.bt} (${bt.name})`);
+                    const btClicked = await clickValueRow(page, bt.bt);
+                    if (!btClicked) {
+                      logger.warn(`    │ ⚠ Could not click BT ${bt.bt}`);
+                      continue;
+                    }
+
+                    await assertNotBlocked(page, `bt-${bt.bt}`);
+                    const oems = await extractOemsFromPage(page);
+
+                    if (oems.length > 0) {
+                      const rows = oems.map(o => ({
+                        vin: `PL24-${brand}-${model.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 30)}`,
+                        brand: brand.toUpperCase(), model,
+                        oem: o.oem, description: o.description,
+                        bildtafel: bt.bt,
+                        hg_code: hg.code, hg_name: hg.name,
+                        fg_code: bt.ug, fg_name: bt.name,
+                      }));
+                      const inserted = insertResults(jobId, rows);
+                      incrementJobParts(jobId, inserted);
+                      totalOems += inserted;
+                      logger.info(`    │ ✅ BT ${bt.bt}: ${inserted} OEMs stored (total: ${totalOems})`);
+                      oems.slice(0, 3).forEach(o => logger.info(`    │    ${o.oem} — ${o.description}`));
+                    } else {
+                      logger.info(`    │ ○ BT ${bt.bt}: 0 OEMs`);
+                    }
+
+                    consecutiveErrors = 0;
+                    currentBackoffMs = config.bulkDelayMs;
+                  } catch (err: any) {
+                    consecutiveErrors++;
+                    logger.error(`    │ ❌ BT ${bt.bt}: ${err.message}`);
+                    errors.push(`${model}/HG${hg.code}/BT${bt.bt}: ${err.message}`);
+                    currentBackoffMs = Math.min(currentBackoffMs * 2, MAX_BACKOFF_MS);
+                    if (consecutiveErrors >= config.bulkMaxConsecutiveErrors) {
+                      logger.error(`    │ 🛑 ${consecutiveErrors} consecutive errors — pausing`);
+                      bulkPaused = true;
+                      break;
+                    }
                   }
-
-                  logger.info(`    │ 🖱 BT ${bi + 1}/${bildtafeln.length}: ${bt.bt} (${bt.name})`);
-                  const btClicked = await clickValueRow(page, bt.bt);
-                  if (!btClicked) {
-                    logger.warn(`    │ ⚠ Could not click BT ${bt.bt}`);
-                    continue;
-                  }
-
-                  await assertNotBlocked(page, `bt-${bt.bt}`);
-                  const oems = await extractOemsFromPage(page);
-
-                  if (oems.length > 0) {
-                    // Store results
-                    const rows = oems.map(o => ({
-                      vin: `PL24-${brand}-${model.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 30)}`,
-                      brand: brand.toUpperCase(), model,
-                      oem: o.oem, description: o.description,
-                      bildtafel: bt.bt,
-                      hg_code: hg.code, hg_name: hg.name,
-                      fg_code: bt.ug, fg_name: bt.name,
-                    }));
-
-                    // Store results in database!
-                    const inserted = insertResults(jobId, rows);
-                    incrementJobParts(jobId, inserted);
-                    totalOems += inserted;
-                    logger.info(`    │ ✅ BT ${bt.bt}: ${inserted} OEMs stored (total: ${totalOems})`);
-
-                    // Log first few OEMs for visibility
-                    oems.slice(0, 3).forEach(o =>
-                      logger.info(`    │    ${o.oem} — ${o.description}`)
-                    );
-                    if (oems.length > 3) logger.info(`    │    ... and ${oems.length - 3} more`);
-                  } else {
-                    logger.info(`    │ ○ BT ${bt.bt}: 0 OEMs`);
-                  }
-
-                  consecutiveErrors = 0;
-                  currentBackoffMs = config.bulkDelayMs;
-
-                } catch (err: any) {
-                  consecutiveErrors++;
-                  logger.error(`    │ ❌ BT ${bt.bt}: ${err.message}`);
-                  errors.push(`${model}/HG${hg.code}/BT${bt.bt}: ${err.message}`);
-
-                  currentBackoffMs = Math.min(currentBackoffMs * 2, MAX_BACKOFF_MS);
-                  if (consecutiveErrors >= config.bulkMaxConsecutiveErrors) {
-                    logger.error(`    │ 🛑 ${consecutiveErrors} consecutive errors — pausing`);
-                    bulkPaused = true;
-                    break;
+                  await sleep(currentBackoffMs);
+                }
+              } else {
+                // ── No BTs found → Look for UG entries (2-digit codes) ──
+                // PL24 subGroupsIllusTable often shows UG entries directly
+                const ugEntries: Array<{ code: string; name: string; fullText: string }> = [];
+                const seen = new Set<string>();
+                for (let i = 0; i < btValues.length; i++) {
+                  const v = btValues[i];
+                  if (/^\d{2}$/.test(v) && !seen.has(v) && parseInt(v) >= 10) {
+                    seen.add(v);
+                    const name = (i + 1 < btValues.length && !/^\d{1,3}(-\d{3})?$/.test(btValues[i + 1]))
+                      ? btValues[i + 1] : '';
+                    ugEntries.push({ code: v, name, fullText: name ? `${v}  ${name}` : v });
                   }
                 }
 
-                await sleep(currentBackoffMs);
+                logger.info(`    │ 📂 ${ugEntries.length} Untergruppen (UG) found — clicking each to find OEMs`);
+                if (ugEntries.length > 0) {
+                  ugEntries.slice(0, 5).forEach(u => logger.info(`    │    UG ${u.code}: ${u.name}`));
+                  if (ugEntries.length > 5) logger.info(`    │    ... and ${ugEntries.length - 5} more`);
+                }
+
+                const subGroupUrl = page.url();
+
+                for (let ui = 0; ui < ugEntries.length; ui++) {
+                  const ug = ugEntries[ui];
+                  if (bulkPaused) break;
+
+                  try {
+                    if (ui > 0) {
+                      await page.goto(subGroupUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+                      await humanDelay(1500, 2500);
+                    }
+
+                    logger.info(`    │ 🖱 UG ${ui + 1}/${ugEntries.length}: ${ug.code} ${ug.name}`);
+                    // Try clicking by code first, then full text
+                    let ugClicked = await clickValueRow(page, ug.code);
+                    if (!ugClicked && ug.name) {
+                      ugClicked = await clickValueRow(page, ug.name);
+                    }
+                    if (!ugClicked) {
+                      logger.warn(`    │ ⚠ Could not click UG ${ug.code} — skipping`);
+                      continue;
+                    }
+
+                    await humanDelay(2000, 3000);
+
+                    // Check what page we're on after clicking UG
+                    const ugLevel = detectPageLevel([], page.url());
+                    logger.info(`    │ 📍 Post-UG level: ${ugLevel}`);
+
+                    // Try to extract OEMs from whatever page we landed on
+                    const oems = await extractOemsFromPage(page);
+
+                    if (oems.length > 0) {
+                      const rows = oems.map(o => ({
+                        vin: `PL24-${brand}-${model.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 30)}`,
+                        brand: brand.toUpperCase(), model,
+                        oem: o.oem, description: o.description,
+                        bildtafel: ug.code,
+                        hg_code: hg.code, hg_name: hg.name,
+                        fg_code: ug.code, fg_name: ug.name,
+                      }));
+                      const inserted = insertResults(jobId, rows);
+                      incrementJobParts(jobId, inserted);
+                      totalOems += inserted;
+                      logger.info(`    │ ✅ UG ${ug.code}: ${inserted} OEMs stored (total: ${totalOems})`);
+                      oems.slice(0, 3).forEach(o => logger.info(`    │    ${o.oem} — ${o.description}`));
+                      if (oems.length > 3) logger.info(`    │    ... and ${oems.length - 3} more`);
+                    } else {
+                      logger.info(`    │ ○ UG ${ug.code}: 0 OEMs (may need deeper drill-down)`);
+                    }
+
+                    consecutiveErrors = 0;
+                    currentBackoffMs = config.bulkDelayMs;
+                  } catch (err: any) {
+                    consecutiveErrors++;
+                    logger.error(`    │ ❌ UG ${ug.code}: ${err.message}`);
+                    errors.push(`${model}/HG${hg.code}/UG${ug.code}: ${err.message}`);
+                    currentBackoffMs = Math.min(currentBackoffMs * 2, MAX_BACKOFF_MS);
+                    if (consecutiveErrors >= config.bulkMaxConsecutiveErrors) {
+                      bulkPaused = true;
+                      break;
+                    }
+                  }
+                  await sleep(currentBackoffMs);
+                }
               }
+
             } else if (btLevel === 'parts') {
               // HG directly shows parts (no Bildtafeln)
               const oems = await extractOemsFromPage(page);
