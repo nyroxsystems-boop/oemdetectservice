@@ -78,57 +78,19 @@ export interface DiscoveredModel {
 
 /**
  * Discover all brands & models from PL24.
- * Clicks each brand logo → reads the "Modell" column from the SPA table.
+ * Uses ONE page, ONE login, then clicks through all brand logos.
+ * After clicking a brand, reads models from the SPA table, then goes back.
  */
 export async function discoverBrandsAndModels(): Promise<{
   brands: string[];
   models: DiscoveredModel[];
   errors: string[];
 }> {
-  const allModels: DiscoveredModel[] = [];
-  const discoveredBrands: string[] = [];
-  const errors: string[] = [];
-
-  const brandsToDiscover = Object.keys(BRAND_MAP);
-  logger.info(`[Discover] Starting discovery for ${brandsToDiscover.length} brands...`);
-
-  for (const brandKey of brandsToDiscover) {
-    if (bulkPaused) break;
-
-    try {
-      const models = await discoverModelsForBrand(brandKey);
-      if (models.length > 0) {
-        discoveredBrands.push(brandKey);
-        allModels.push(...models);
-
-        for (const m of models) {
-          try {
-            upsertVehicle({
-              vin: `PL24-${brandKey}-${m.model.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 30)}`,
-              brand: brandKey,
-              model: m.model,
-            });
-          } catch { /* duplicate — fine */ }
-        }
-
-        logger.info(`[Discover] ${brandKey}: ${models.length} models found`);
-      } else {
-        logger.warn(`[Discover] ${brandKey}: no models found`);
-      }
-    } catch (err: any) {
-      logger.error(`[Discover] ${brandKey} failed: ${err.message}`);
-      errors.push(`${brandKey}: ${err.message}`);
-    }
-
-    await sleep(config.bulkDelayMs);
-  }
-
-  logger.info(`[Discover] Complete: ${discoveredBrands.length} brands, ${allModels.length} models`);
-  return { brands: discoveredBrands, models: allModels, errors };
-}
-
-async function discoverModelsForBrand(brandKey: string): Promise<DiscoveredModel[]> {
   return enqueue(async () => {
+    const allModels: DiscoveredModel[] = [];
+    const discoveredBrands: string[] = [];
+    const errors: string[] = [];
+
     const ctx = getContext();
     if (!ctx) throw new Error('Browser not initialized');
 
@@ -138,41 +100,133 @@ async function discoverModelsForBrand(brandKey: string): Promise<DiscoveredModel
     });
 
     try {
+      // Step 1: Login ONCE — same flow as the single OEM scraper
       const loggedIn = await ensureLoggedIn(page);
       if (!loggedIn) throw new Error('Login failed');
 
-      // Go to dashboard
-      await page.goto('https://www.partslink24.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await waitForStable(page);
-      await humanDelay(2000, 3000);
+      logger.info('[Discover] Login successful, starting brand discovery...');
+      await takeScreenshot(page, 'discover-after-login');
 
-      // Click brand logo
-      const brandClicked = await selectBrand(page, brandKey);
-      if (!brandClicked) return [];
+      // Step 2: We should now be on the dashboard with brand logos
+      // Verify we see the brand grid
+      const dashboardUrl = page.url();
+      logger.info(`[Discover] Dashboard URL: ${dashboardUrl}`);
 
-      // Wait for SPA table to load with "Modell" column
-      await humanDelay(3000, 5000);
-      await assertNotBlocked(page, `discover-${brandKey}`);
+      const brandsToDiscover = Object.keys(BRAND_MAP);
+      logger.info(`[Discover] Will discover ${brandsToDiscover.length} brands...`);
 
-      // Wait for the model table
-      try {
-        await page.locator('text=Modell').first().waitFor({ state: 'visible', timeout: 15000 });
-      } catch {
-        logger.warn(`[Discover] ${brandKey}: "Modell" column not found`);
-        await takeScreenshot(page, `discover-${brandKey}-no-table`);
-        return [];
+      for (const brandKey of brandsToDiscover) {
+        if (bulkPaused) break;
+
+        try {
+          // Navigate back to dashboard for each brand
+          await page.goto('https://www.partslink24.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await waitForStable(page);
+          await humanDelay(2000, 3000);
+
+          // Verify we're on the dashboard (not redirected to login)
+          const currentUrl = page.url();
+          const bodyText = await page.locator('body').innerText({ timeout: 5000 });
+          const onDashboard = bodyText.toLowerCase().includes('abmelden') ||
+                              bodyText.toLowerCase().includes('herzlich willkommen') ||
+                              bodyText.toLowerCase().includes('fahrgestellnummer');
+
+          if (!onDashboard) {
+            logger.warn(`[Discover] Not on dashboard, re-logging in. URL: ${currentUrl}`);
+            const relogged = await ensureLoggedIn(page);
+            if (!relogged) {
+              errors.push(`${brandKey}: Re-login failed`);
+              continue;
+            }
+          }
+
+          await assertNotBlocked(page, `discover-${brandKey}`);
+
+          // Click brand logo
+          const brandClicked = await selectBrand(page, brandKey);
+          if (!brandClicked) {
+            logger.warn(`[Discover] Brand "${brandKey}" not found on dashboard`);
+            continue;
+          }
+
+          // Wait for SPA to load
+          await humanDelay(3000, 5000);
+
+          // Check if we landed on the model table or the catalog SPA
+          const afterClickUrl = page.url();
+          logger.info(`[Discover] After clicking ${brandKey}: ${afterClickUrl}`);
+          await takeScreenshot(page, `discover-${brandKey}`);
+
+          // Try to find model entries
+          let models: string[] = [];
+
+          // Method 1: Look for "Modell" column header (SPA table)
+          try {
+            await page.locator('text=Modell').first().waitFor({ state: 'visible', timeout: 10000 });
+            models = await extractColumnEntries(page, 0);
+            logger.info(`[Discover] ${brandKey}: found ${models.length} models via table`);
+          } catch {
+            logger.info(`[Discover] ${brandKey}: no "Modell" table, trying text extraction`);
+          }
+
+          // Method 2: Extract model-like text from the page
+          if (models.length === 0) {
+            const pageText = await page.locator('body').innerText({ timeout: 8000 });
+            const lines = pageText.split('\n');
+            const seen = new Set<string>();
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (trimmed.length < 3 || trimmed.length > 60) continue;
+              // Skip UI elements
+              if (/^(Modell|Modelljahr|Einschränkung|Hauptgruppe|Startseite|Abmelden|Login|Direkteinstieg|Teile suchen|Händler wählen|GO|partslink)/i.test(trimmed)) continue;
+              // Model names start with the brand name or a letter/number
+              if (/^[A-Za-zÀ-ÿ0-9]/.test(trimmed) && !seen.has(trimmed.toLowerCase())) {
+                // Check if this looks like a car model (contains brand name or common model patterns)
+                const brandNames = BRAND_MAP[brandKey] || [brandKey];
+                const isModel = brandNames.some(bn => trimmed.toLowerCase().includes(bn.toLowerCase())) ||
+                                /^\d{1,3}\s/.test(trimmed) || // "3er", "100", "A3"
+                                /^[A-Z][A-Za-z0-9\-/ ]{1,30}$/.test(trimmed);
+                if (isModel) {
+                  seen.add(trimmed.toLowerCase());
+                  models.push(trimmed);
+                }
+              }
+            }
+          }
+
+          if (models.length > 0) {
+            discoveredBrands.push(brandKey);
+            for (const model of models) {
+              allModels.push({ brand: brandKey, model });
+              try {
+                upsertVehicle({
+                  vin: `PL24-${brandKey}-${model.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 30)}`,
+                  brand: brandKey,
+                  model,
+                });
+              } catch { /* duplicate */ }
+            }
+            logger.info(`[Discover] ${brandKey}: ${models.length} models saved`);
+          } else {
+            logger.warn(`[Discover] ${brandKey}: no models found`);
+          }
+
+        } catch (err: any) {
+          logger.error(`[Discover] ${brandKey} failed: ${err.message}`);
+          errors.push(`${brandKey}: ${err.message}`);
+        }
+
+        await sleep(config.bulkDelayMs);
       }
 
-      // Extract model names from the first column of the SPA table
-      // PL24 SPA: Table with "Modell" header, rows are clickable text entries
-      const models = await extractColumnEntries(page, 0);
-
-      return models.map(name => ({ brand: brandKey, model: name }));
+      logger.info(`[Discover] Complete: ${discoveredBrands.length} brands, ${allModels.length} models`);
+      return { brands: discoveredBrands, models: allModels, errors };
 
     } finally {
       await page.close();
     }
-  }, `discover-${brandKey}`, 'low');
+  }, 'discover-all-brands', 'low');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -294,20 +348,8 @@ async function discoverCatalogStructure(job: BulkJob): Promise<Array<{
     });
 
     try {
-      const loggedIn = await ensureLoggedIn(page);
-      if (!loggedIn) throw new Error('Login failed');
-
-      // Navigate to brand
-      await page.goto('https://www.partslink24.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await waitForStable(page);
-      await humanDelay(2000, 3000);
-
-      const brandClicked = await selectBrand(page, job.brand);
-      if (!brandClicked) throw new Error(`Brand ${job.brand} not found`);
-      await humanDelay(3000, 5000);
-
-      // Wait for model table
-      await page.locator('text=Modell').first().waitFor({ state: 'visible', timeout: 15000 });
+      // Use navigateToCatalog which handles login + dashboard verification
+      await navigateToCatalog(page, job);
 
       // Click model in the table
       const modelClicked = await clickTableEntry(page, job.model);
@@ -609,10 +651,25 @@ async function processNode(job: BulkJob, node: BulkProgressEntry): Promise<void>
 // ── Navigate to Catalog (Brand → Model → Year → Einschränkung) ──────────────
 
 async function navigateToCatalog(page: Page, job: BulkJob): Promise<void> {
-  // Go to dashboard
+  // Login first (this navigates to PL24 and logs in if needed)
+  const loggedIn = await ensureLoggedIn(page);
+  if (!loggedIn) throw new Error('Login failed');
+
+  // Now we're on the dashboard — navigate to it to ensure clean state
   await page.goto('https://www.partslink24.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
   await waitForStable(page);
   await humanDelay(2000, 3000);
+
+  // Verify we're on the dashboard
+  const bodyText = await page.locator('body').innerText({ timeout: 5000 });
+  const onDashboard = bodyText.toLowerCase().includes('abmelden') ||
+                      bodyText.toLowerCase().includes('herzlich willkommen');
+  if (!onDashboard) {
+    logger.warn('[BulkCrawler] Not on dashboard after navigation, trying re-login');
+    const relogged = await ensureLoggedIn(page);
+    if (!relogged) throw new Error('Re-login failed');
+    // After re-login, page should be on dashboard
+  }
 
   // Click brand
   const brandClicked = await selectBrand(page, job.brand);
