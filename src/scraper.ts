@@ -346,72 +346,92 @@ async function login(page: Page): Promise<boolean> {
     logger.info('Submitting login via Enter key on password field...');
     await passField.press('Enter');
 
-    // Wait for page navigation/change
-    await humanDelay(2000, 3000);
+    // Wait for redirect PROPERLY — give PL24 up to 15s to redirect after Enter
+    logger.info('Waiting for post-login redirect...');
+    let loginRedirected = false;
+    try {
+      await page.waitForURL(url => {
+        const u = url.toString().toLowerCase();
+        return !u.includes('login') && !u.includes('startup');
+      }, { timeout: 15000 });
+      loginRedirected = true;
+      logger.info(`✅ Login redirect detected: ${page.url()}`);
+    } catch {
+      logger.info(`Post-login URL (after 15s): ${page.url()}`);
+    }
 
-    // Check if login succeeded via URL or DOM signals
-    const postLoginUrl = page.url();
-    logger.info(`Post-login URL: ${postLoginUrl}`);
-
-    // If URL still looks like login page, try clicking the actual submit button
-    if (postLoginUrl.includes('login') || postLoginUrl.includes('startup')) {
-      logger.info('Still on login page after Enter — trying button click...');
+    // ONLY if Enter truly didn't work (URL still on login page), try button click
+    if (!loginRedirected) {
+      logger.info('Enter key did not redirect — trying button click as fallback...');
 
       const loginSelectors = [
-        'input[value="Login"]',                      // input submit button (exact)
-        'input[value="LOGIN"]',                      // uppercase variant
+        'input[value="Login"]',
+        'input[value="LOGIN"]',
         'input[type="submit"][value="Login"]',
         'input[type="submit"][value="LOGIN"]',
-        'input[type="submit"]',                       // generic submit
-        'button:has-text("Login")',                   // button element
-        'button[type="submit"]',                      // generic submit button
+        'input[type="submit"]',
+        'button:has-text("Login")',
+        'button[type="submit"]',
       ];
 
+      let buttonClicked = false;
       for (const sel of loginSelectors) {
         try {
           const btn = page.locator(sel).first();
           if (await btn.count() > 0 && await btn.isVisible({ timeout: 2000 })) {
             logger.info(`Clicking Login via: ${sel}`);
             await btn.click();
-            await humanDelay(2000, 3000);
+            buttonClicked = true;
             break;
           }
         } catch { /* try next */ }
       }
 
-      // Last resort: submit the form containing the password field via JS
+      if (!buttonClicked) {
+        logger.warn('No login button found either — login may have already submitted');
+      }
+
+      // Wait again for redirect after button click
       try {
-        const formSubmitted = await page.evaluate(`
-          (() => {
-            const pass = document.querySelector('input[type="password"]');
-            const form = pass?.closest('form');
-            if (form) { form.submit(); return true; }
-            return false;
-          })()
-        `);
-        if (formSubmitted) {
-          logger.info('Login submitted via form.submit()');
-          await humanDelay(2000, 3000);
-        }
-      } catch { /* ignore */ }
+        await page.waitForURL(url => {
+          const u = url.toString().toLowerCase();
+          return !u.includes('login') && !u.includes('startup');
+        }, { timeout: 15000 });
+        loginRedirected = true;
+        logger.info(`✅ Login redirect after button click: ${page.url()}`);
+      } catch {
+        logger.warn(`Still on login page after button click: ${page.url()}`);
+      }
     }
 
     // ── Wait for dashboard to load ──
     logger.info('Waiting for dashboard to load...');
-    let dashboardLoaded = false;
+    let dashboardLoaded = loginRedirected;
 
-    // Strategy 1: Wait for URL change to non-login URL
-    try {
-      await page.waitForURL(url => {
-        const u = url.toString().toLowerCase();
-        return !u.includes('login') && !u.includes('startup') &&
-               (u.includes('brandMenu') || u.includes('dashboard') ||
-                u.includes('pl24-app') || u.includes('partslink24.com/partslink24/'));
-      }, { timeout: 20000 });
-      logger.info(`Dashboard URL detected: ${page.url()}`);
-      dashboardLoaded = true;
-    } catch {
-      logger.warn('URL did not change to dashboard within 20s');
+    // If already redirected, verify we're on the dashboard
+    if (dashboardLoaded) {
+      const currentUrl = page.url().toLowerCase();
+      dashboardLoaded = currentUrl.includes('brandmenu') || currentUrl.includes('dashboard') ||
+                        currentUrl.includes('pl24-app') || currentUrl.includes('partslink24/user/');
+      if (dashboardLoaded) {
+        logger.info(`Dashboard URL confirmed: ${page.url()}`);
+      }
+    }
+
+    // Fallback: wait for URL change if not yet detected
+    if (!dashboardLoaded) {
+      try {
+        await page.waitForURL(url => {
+          const u = url.toString().toLowerCase();
+          return !u.includes('login') && !u.includes('startup') &&
+                 (u.includes('brandmenu') || u.includes('dashboard') ||
+                  u.includes('pl24-app') || u.includes('partslink24.com/partslink24/'));
+        }, { timeout: 10000 });
+        logger.info(`Dashboard URL detected: ${page.url()}`);
+        dashboardLoaded = true;
+      } catch {
+        logger.warn('URL did not change to dashboard');
+      }
     }
 
     // Strategy 2: Wait for "Abmelden" text (most reliable DOM signal)
