@@ -240,7 +240,7 @@ app.post('/api/bulk/vehicles', (req: Request, res: Response) => {
 });
 
 app.put('/api/bulk/vehicles/:id', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id);
+  const id = parseInt(String(req.params.id));
   const updated = updateVehicle(id, req.body);
   if (!updated) return res.status(404).json({ error: 'Vehicle not found' });
   res.json({ success: true });
@@ -274,7 +274,7 @@ app.post('/api/bulk/vehicles/seed', (_req: Request, res: Response) => {
 });
 
 app.delete('/api/bulk/vehicles/:id', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id);
+  const id = parseInt(String(req.params.id));
   const deleted = deleteVehicle(id);
   if (!deleted) return res.status(404).json({ error: 'Vehicle not found' });
   res.json({ success: true });
@@ -331,7 +331,7 @@ app.post('/api/bulk/jobs/start-all', async (_req: Request, res: Response) => {
 });
 
 app.post('/api/bulk/jobs/:id/pause', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id);
+  const id = parseInt(String(req.params.id));
   const job = getJob(id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
@@ -340,7 +340,7 @@ app.post('/api/bulk/jobs/:id/pause', (req: Request, res: Response) => {
 });
 
 app.post('/api/bulk/jobs/:id/resume', async (req: Request, res: Response) => {
-  const id = parseInt(req.params.id);
+  const id = parseInt(String(req.params.id));
   const job = getJob(id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.status !== 'paused') return res.status(400).json({ error: 'Job is not paused' });
@@ -353,7 +353,7 @@ app.post('/api/bulk/jobs/:id/resume', async (req: Request, res: Response) => {
 });
 
 app.post('/api/bulk/jobs/:id/cancel', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id);
+  const id = parseInt(String(req.params.id));
   const job = getJob(id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
@@ -373,7 +373,7 @@ app.get('/api/bulk/jobs', (req: Request, res: Response) => {
 });
 
 app.get('/api/bulk/jobs/:id', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id);
+  const id = parseInt(String(req.params.id));
   const job = getJob(id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
@@ -382,7 +382,7 @@ app.get('/api/bulk/jobs/:id', (req: Request, res: Response) => {
 });
 
 app.get('/api/bulk/jobs/:id/results', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id);
+  const id = parseInt(String(req.params.id));
   const limit = parseInt(req.query.limit as string || '50');
   const offset = parseInt(req.query.offset as string || '0');
   const search = req.query.search as string | undefined;
