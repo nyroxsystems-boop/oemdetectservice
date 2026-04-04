@@ -119,43 +119,51 @@ async function logPageState(page: Page, context: string): Promise<string[]> {
 }
 
 /**
+ * Extract the widget ID from a PL24 SPA URL.
+ * PL24 URLs encode state as base64 JSON in the path:
+ *   /pl24-app/audi_parts/0/{base64_json}/
+ * The JSON contains {"path":"...","wid":"mainGroupsTable"}
+ */
+function extractWidgetId(url: string): string | null {
+  try {
+    const urlObj = new URL(url);
+    const segments = urlObj.pathname.split('/').filter(Boolean);
+    // Find the last segment that looks like base64 (starts with 'ey' = '{"')
+    for (let i = segments.length - 1; i >= 0; i--) {
+      let seg = segments[i];
+      if (!seg.startsWith('ey')) continue;
+      // Double URL-decode (PL24 double-encodes)
+      try { seg = decodeURIComponent(seg); } catch {}
+      try { seg = decodeURIComponent(seg); } catch {}
+      // Pad base64 if needed
+      while (seg.length % 4 !== 0) seg += '=';
+      const json = Buffer.from(seg, 'base64').toString('utf-8');
+      const data = JSON.parse(json);
+      return data.wid || null;
+    }
+  } catch { /* URL parsing or base64 decode failed */ }
+  return null;
+}
+
+/**
  * Detect what "level" the page is at in the PL24 SPA hierarchy.
- * PRIMARY: Use URL patterns (most reliable in SPA where sidebar shows all levels)
- * FALLBACK: Content analysis
+ * PRIMARY: Decode base64 URL payload to get widget ID (100% reliable)
+ * FALLBACK: Content analysis (for URLs without base64 payload)
  */
 function detectPageLevel(values: string[], url?: string): string {
-  // ── PRIMARY: URL-based detection ──
+  // ── PRIMARY: Decode widget ID from base64 URL ──
   if (url) {
-    // Decode URL to check widget IDs encoded in base64 path
-    const decodedUrl = decodeURIComponent(url).toLowerCase();
-    
-    // subGroupsIllusTable = Bildtafeln/Subgroups page (after clicking an HG)
-    if (decodedUrl.includes('subgroupsillustable') || decodedUrl.includes('subgroups')) {
-      return 'bildtafeln';
-    }
-    // mainGroupsTable = Hauptgruppen page
-    if (decodedUrl.includes('maingroupstable')) {
-      return 'hg';
-    }
-    // restrictionTable = Restriction/engine selection
-    if (decodedUrl.includes('restrictiontable')) {
-      return 'restrictions';
-    }
-    // modelYearTable = Year selection
-    if (decodedUrl.includes('modelyeartable')) {
-      return 'years';
-    }
-    // engineTable = Engine selection (Jaguar/Land Rover)
-    if (decodedUrl.includes('enginetable')) {
-      return 'restrictions';
-    }
-    // categoryTypesTable = Category selection (MAN)
-    if (decodedUrl.includes('categorytypestable')) {
-      return 'models';
-    }
-    // partDetailsTable = Parts page
-    if (decodedUrl.includes('partdetailstable') || decodedUrl.includes('partinfo')) {
-      return 'parts';
+    const wid = extractWidgetId(url);
+    if (wid) {
+      const w = wid.toLowerCase();
+      if (w.includes('subgroupsillus') || w.includes('subgroup')) return 'bildtafeln';
+      if (w.includes('maingroups')) return 'hg';
+      if (w.includes('restriction')) return 'restrictions';
+      if (w.includes('modelyear')) return 'years';
+      if (w.includes('engine')) return 'restrictions';
+      if (w.includes('categorytypes')) return 'models';
+      if (w.includes('partdetail') || w.includes('partinfo')) return 'parts';
+      logger.info(`  ℹ️ Unknown widget ID: "${wid}" — falling back to content analysis`);
     }
   }
 
@@ -491,18 +499,28 @@ export async function crawlSingleBrand(brand: string): Promise<{
               break;
             }
           } else if (level === 'models' || level === 'restrictions' || level === 'unknown') {
-            // Might be a sub-model or restriction list — click first option
+            // Restriction or sub-model list — filter out sidebar model names
+            // Sidebar always shows all models (e.g., "Audi A3", "Audi A4")
+            // so we skip values that look like model entries from the sidebar
+            const brandPrefix = brand.charAt(0) + brand.slice(1).toLowerCase(); // "AUDI" → "Audi"
             const options = values.filter(v =>
-              v.length > 3 && !/^\d{4}$/.test(v) && !/^\d{1,2}$/.test(v) &&
-              !/^(Modell|Hauptgruppe|Einschränkung|Modelljahr|Startseite)/.test(v)
+              v.length > 2 &&
+              !/^\d{4}$/.test(v) &&                 // not years
+              !/^\d{1,2}$/.test(v) &&                // not single/double digits
+              !/^\d\s+.+/.test(v) &&                 // not HG entries like "1  Motor"
+              !/^(Modell|Hauptgruppe|Einschränkung|Modelljahr|Startseite|Kataloginformationen)/.test(v) &&
+              !v.startsWith(brandPrefix) &&          // not sidebar model names ("Audi A3")
+              !v.startsWith(brand) &&                // not sidebar model names ("AUDI A3")
+              !/^(Sonderkataloge|Elektrische|Chemische|MSP|Seiten)/.test(v) // not footer items
             );
 
+            logger.info(`  🔍 Restriction/drill-down candidates: ${options.length} (filtered from ${values.length} total)`);
             if (options.length > 0) {
-              logger.info(`  🔽 Drill-down: clicking first option: "${options[0]}" (${options.length} available)`);
+              logger.info(`  🔽 Drill-down: clicking "${options[0]}" (from: ${options.slice(0, 5).join(', ')})`);
               await clickValueRow(page, options[0]);
               values = await logPageState(page, `After drill-down "${options[0]}"`);
               level = detectPageLevel(values, page.url());
-              logger.info(`  📍 Page level: ${level} (URL-based)`);
+              logger.info(`  📍 Page level: ${level}`);
             } else {
               logger.warn(`  ⚠ No drill-down options found — giving up on ${model}`);
               break;
@@ -542,15 +560,31 @@ export async function crawlSingleBrand(brand: string): Promise<{
               await humanDelay(2000, 3000);
             }
 
-            logger.info(`    │ 🖱 Clicking HG: "${hg.name}"`);
-            const hgClicked = await clickValueRow(page, hg.name);
+            // Click using FULL text (e.g., "1  Motor") — not just the name ("Motor")
+            // because PL24 spans contain the full HG text, not just the name
+            const fullHgText = values.find(v => new RegExp(`^${hg.code}\\s+`).test(v));
+            const clickTarget = fullHgText || hg.name;
+            logger.info(`    │ 🖱 Clicking HG: "${clickTarget}"`);
+            const hgClicked = await clickValueRow(page, clickTarget);
             if (!hgClicked) {
-              // Try clicking by code
-              const codeClicked = await clickValueRow(page, hg.code);
-              if (!codeClicked) {
-                logger.warn(`    │ ⚠ Could not click HG ${hg.code} — skipping`);
-                continue;
+              // Fallback: try name only, then code
+              logger.info(`    │ 🔄 Retry with name: "${hg.name}"`);
+              const nameClicked = await clickValueRow(page, hg.name);
+              if (!nameClicked) {
+                logger.info(`    │ 🔄 Retry with code: "${hg.code}"`);
+                const codeClicked = await clickValueRow(page, hg.code);
+                if (!codeClicked) {
+                  logger.warn(`    │ ⚠ Could not click HG ${hg.code} — skipping`);
+                  continue;
+                }
               }
+            }
+
+            // Verify URL actually changed after HG click
+            const postHgUrl = page.url();
+            if (postHgUrl === hgPageUrl) {
+              logger.warn(`    │ ⚠ URL did not change after HG click — click may not have navigated`);
+              await humanDelay(2000, 3000);
             }
 
             const btValues = await logPageState(page, `HG ${hg.code} ${hg.name}`);
