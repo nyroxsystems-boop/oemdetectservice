@@ -566,19 +566,81 @@ const BRAND_MAP: Record<string, string[]> = {
 
 export { BRAND_MAP };
 
+/**
+ * PL24 service names used in launchCatalog.do URLs.
+ * Discovered from real PL24 dashboard HTML (April 2026):
+ *   <a href="/partslink24/launchCatalog.do?service=audi_parts&t=...">Audi</a>
+ */
+const PL24_SERVICE_MAP: Record<string, string> = {
+  VW:          'vw_parts',
+  VOLKSWAGEN:  'vw_parts',
+  AUDI:        'audi_parts',
+  BMW:         'bmw_parts',
+  MERCEDES:    'mercedes_parts',
+  PORSCHE:     'porsche_parts',
+  SEAT:        'seat_parts',
+  SKODA:       'skoda_parts',
+  CUPRA:       'cupra_parts',
+  FORD:        'fordp_parts',
+  OPEL:        'opel_parts',
+  TOYOTA:      'toyota_parts',
+  HYUNDAI:     'hyundai_parts',
+  KIA:         'kia_parts',
+  RENAULT:     'renault_parts',
+  PEUGEOT:     'peugeot_parts',
+  CITROEN:     'citroen_parts',
+  FIAT:        'fiatp_parts',
+  VOLVO:       'volvo_parts',
+  JAGUAR:      'jaguar_parts',
+  'LAND ROVER':'landrover_parts',
+  MINI:        'mini_parts',
+  NISSAN:      'nissan_parts',
+  HONDA:       'honda_parts',
+  MAZDA:       'mazda_parts',
+  SUZUKI:      'suzuki_parts',
+  LEXUS:       'lexus_parts',
+  BENTLEY:     'bentley_parts',
+  DACIA:       'dacia_parts',
+  JEEP:        'jeep_parts',
+  ALPINE:      'alpine_parts',
+  IVECO:       'iveco_parts',
+  INFINITI:    'infiniti_parts',
+  MAN:         'man_parts',
+};
+
+export { PL24_SERVICE_MAP };
+
 export async function selectBrand(page: Page, brand: string): Promise<boolean> {
   const upper = brand.toUpperCase();
   const names = BRAND_MAP[upper] || [brand];
+  const serviceName = PL24_SERVICE_MAP[upper];
 
+  // Strategy 1: Click launchCatalog link by service name (most reliable)
+  // PL24 dashboard uses: <a href="/partslink24/launchCatalog.do?service=audi_parts&t=...">
+  if (serviceName) {
+    try {
+      const sel = `a[href*="service=${serviceName}"]`;
+      const el = page.locator(sel).first();
+      if (await el.count() > 0) {
+        logger.info(`Selecting brand "${brand}" via launchCatalog: ${sel}`);
+        await el.click();
+        await waitForStable(page);
+        await humanDelay(500, 1000);
+        return true;
+      }
+    } catch { /* try next */ }
+  }
+
+  // Strategy 2: Click link by brand text (backup)
   for (const name of names) {
-    // Try img alt match first (brand logos are <img> elements)
-    const imgSelectors = [
+    const textSelectors = [
+      `a:text-is("${name}")`,
+      `a:has-text("${name}")`,
       `img[alt*="${name}" i]`,
       `a[title*="${name}" i]`,
-      `img[title*="${name}" i]`,
     ];
 
-    for (const sel of imgSelectors) {
+    for (const sel of textSelectors) {
       try {
         const el = page.locator(sel).first();
         if (await el.count() > 0 && await el.isVisible()) {
@@ -591,17 +653,6 @@ export async function selectBrand(page: Page, brand: string): Promise<boolean> {
       } catch { /* try next */ }
     }
   }
-
-  // Fallback: click any link containing brand text
-  try {
-    const textLink = page.locator(`a:has(img[alt*="${brand}" i])`).first();
-    if (await textLink.count() > 0) {
-      await textLink.click();
-      await waitForStable(page);
-      await humanDelay(500, 1000);
-      return true;
-    }
-  } catch { /* ignore */ }
 
   logger.warn(`Brand "${brand}" not found in dashboard grid`);
   return false;

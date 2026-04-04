@@ -1,19 +1,17 @@
 /**
- * 🕷️ BULK CRAWLER — PartsLink24 Catalog Tree Traversal Engine
+ * 🕷️ BULK CRAWLER — PartsLink24 Catalog Scraper
  *
- * Exact PL24 SPA navigation flow (verified from screenshots April 2026):
+ * Verified PL24 flow (tested in live browser April 2026):
  *
- * 1. Dashboard → Click brand logo (Audi, BMW, VW...)
- * 2. SPA Table with multi-column drill-down:
- *    Modell → Modelljahr → Einschränkung I → II → III
- * 3. Hauptgruppe page (SINGLE digit: 1-9, 0):
- *    1 Motor | 2 Kraftstoff,Abgas,Kühlung | 3 Getriebe | ...
- * 4. Bildtafel list (format XXX-YYY):
- *    Untergruppe | Bildtafel | Benennung | Bemerkung | Modellangabe
- * 5. Parts page with OEM numbers:
- *    Pos. | Teilenummer | Benennung | Bemerkung | Stk. | Modellangabe
- *
- * No VINs needed — navigates entirely by clicking through PL24 UI.
+ * 1. Dashboard (brandMenu.do): Brand links = <a href="/partslink24/launchCatalog.do?service={brand}_parts">
+ * 2. SPA (/pl24-app/{brand}_parts/0/0): Multi-column drill-down table
+ *    - All data in <span> inside <div class="_value_*"> (React CSS modules)
+ *    - Column 1: Modell → click to drill down
+ *    - Column 2: Modelljahr → click to drill down
+ *    - Column 3+: Einschränkung (optional)
+ * 3. HG page: Single-digit codes (1-9, 0) in same _value_ spans
+ * 4. Bildtafel list: UG | Bildtafel (XXX-YYY) | Benennung — click row to open
+ * 5. Parts page: OEM numbers in _value_ spans matching /^[A-Z0-9]{3}\s\d{3}\s\d{3}/
  */
 
 import { Page } from 'playwright';
@@ -21,7 +19,7 @@ import { logger } from './logger';
 import { config } from './config';
 import { enqueue } from './requestQueue';
 import {
-  ensureLoggedIn, selectBrand, getContext, BRAND_MAP,
+  ensureLoggedIn, selectBrand, getContext, PL24_SERVICE_MAP,
   assertNotBlocked, sleep, humanDelay, waitForStable, takeScreenshot,
 } from './scraper';
 import {
@@ -39,58 +37,103 @@ let bulkPaused = false;
 let currentJobId: number | null = null;
 let consecutiveErrors = 0;
 
-// ── Control Functions ────────────────────────────────────────────────────────
+// ── Control ──────────────────────────────────────────────────────────────────
 
-export function pauseBulk(): void {
-  bulkPaused = true;
-  logger.info('[BulkCrawler] Pause requested');
-}
-
-export function resumeBulk(): void {
-  bulkPaused = false;
-  logger.info('[BulkCrawler] Resume requested');
-}
-
+export function pauseBulk(): void { bulkPaused = true; }
+export function resumeBulk(): void { bulkPaused = false; }
 export function cancelBulk(): void {
-  bulkPaused = true;
-  bulkRunning = false;
-  if (currentJobId) {
-    updateJobStatus(currentJobId, 'paused', { last_error: 'Cancelled by admin' });
-  }
+  bulkPaused = true; bulkRunning = false;
+  if (currentJobId) updateJobStatus(currentJobId, 'paused', { last_error: 'Cancelled by admin' });
   currentJobId = null;
-  logger.info('[BulkCrawler] Cancel requested');
 }
-
-export function getBulkState(): {
-  running: boolean; paused: boolean; currentJobId: number | null;
-} {
+export function getBulkState() {
   return { running: bulkRunning, paused: bulkPaused, currentJobId };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// DISCOVER MODE — Click through brands → discover models from PL24 table
-// ═══════════════════════════════════════════════════════════════════════════
+// ── SPA Helpers (verified from live browser) ─────────────────────────────────
 
-export interface DiscoveredModel {
-  brand: string;
-  model: string;
+/** Read all values from PL24 SPA _value_ spans */
+async function readValueSpans(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+    const values: string[] = [];
+    for (const s of spans) {
+      if (s.children.length === 0) {
+        const t = s.textContent?.trim();
+        if (t && t.length > 0 && t.length < 80) values.push(t);
+      }
+    }
+    return values;
+  });
 }
 
-/**
- * Discover all brands & models from PL24.
- * Uses ONE page, ONE login, then clicks through all brand logos.
- * After clicking a brand, reads models from the SPA table, then goes back.
- */
+/** Click a value span by exact or partial text match */
+async function clickValueSpan(page: Page, text: string): Promise<boolean> {
+  const clicked = await page.evaluate((searchText) => {
+    const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+    for (const s of spans) {
+      if (s.children.length === 0 && s.textContent?.trim() === searchText) {
+        (s as HTMLElement).click();
+        return true;
+      }
+    }
+    // Partial match fallback
+    for (const s of spans) {
+      if (s.children.length === 0 && s.textContent?.trim().includes(searchText)) {
+        (s as HTMLElement).click();
+        return true;
+      }
+    }
+    return false;
+  }, text);
+
+  if (clicked) {
+    await waitForStable(page);
+    await humanDelay(1500, 2500);
+  }
+  return clicked;
+}
+
+/** Extract OEM numbers from the current Bildtafel page */
+async function extractOemsFromPage(page: Page): Promise<Array<{ oem: string; description: string }>> {
+  return page.evaluate(() => {
+    const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+    const values: string[] = [];
+    for (const s of spans) {
+      if (s.children.length === 0) {
+        const t = s.textContent?.trim();
+        if (t) values.push(t);
+      }
+    }
+
+    // OEM pattern: 3 alphanumeric + space + 3 digits + space + 3 digits + optional suffix
+    const oemPattern = /^[A-Z0-9]{3}\s\d{3}\s\d{3}(\s[A-Z0-9]{0,3})?$/;
+    const results: Array<{ oem: string; description: string }> = [];
+    const seen = new Set<string>();
+
+    for (let i = 0; i < values.length; i++) {
+      if (oemPattern.test(values[i]) && !seen.has(values[i])) {
+        seen.add(values[i]);
+        // Description is typically the next value after the OEM
+        const desc = (i + 1 < values.length && !oemPattern.test(values[i + 1]))
+          ? values[i + 1] : '';
+        results.push({ oem: values[i], description: desc });
+      }
+    }
+    return results;
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DISCOVER MODE
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface DiscoveredModel { brand: string; model: string; }
+
 export async function discoverBrandsAndModels(): Promise<{
-  brands: string[];
-  models: DiscoveredModel[];
-  errors: string[];
+  brands: string[]; models: DiscoveredModel[]; errors: string[];
 }> {
   return enqueue(async () => {
-    const allModels: DiscoveredModel[] = [];
-    const discoveredBrands: string[] = [];
-    const errors: string[] = [];
-
     const ctx = getContext();
     if (!ctx) throw new Error('Browser not initialized');
 
@@ -99,101 +142,49 @@ export async function discoverBrandsAndModels(): Promise<{
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
+    const allModels: DiscoveredModel[] = [];
+    const discoveredBrands: string[] = [];
+    const errors: string[] = [];
+
     try {
-      // Step 1: Login ONCE — same flow as the single OEM scraper
+      // Login once
       const loggedIn = await ensureLoggedIn(page);
       if (!loggedIn) throw new Error('Login failed');
 
-      logger.info('[Discover] Login successful, starting brand discovery...');
-      await takeScreenshot(page, 'discover-after-login');
+      logger.info('[Discover] Login OK, discovering brands...');
 
-      // Step 2: We should now be on the dashboard with brand logos
-      // Verify we see the brand grid
-      const dashboardUrl = page.url();
-      logger.info(`[Discover] Dashboard URL: ${dashboardUrl}`);
-
-      const brandsToDiscover = Object.keys(BRAND_MAP);
-      logger.info(`[Discover] Will discover ${brandsToDiscover.length} brands...`);
+      const brandsToDiscover = Object.keys(PL24_SERVICE_MAP);
 
       for (const brandKey of brandsToDiscover) {
         if (bulkPaused) break;
 
         try {
-          // Navigate back to dashboard for each brand
-          await page.goto('https://www.partslink24.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          // Go back to dashboard
+          await page.goto('https://www.partslink24.com/partslink24/user/brandMenu.do', {
+            waitUntil: 'domcontentloaded', timeout: 30000
+          });
           await waitForStable(page);
-          await humanDelay(2000, 3000);
+          await humanDelay(1500, 2500);
 
-          // Verify we're on the dashboard (not redirected to login)
-          const currentUrl = page.url();
-          const bodyText = await page.locator('body').innerText({ timeout: 5000 });
-          const onDashboard = bodyText.toLowerCase().includes('abmelden') ||
-                              bodyText.toLowerCase().includes('herzlich willkommen') ||
-                              bodyText.toLowerCase().includes('fahrgestellnummer');
-
-          if (!onDashboard) {
-            logger.warn(`[Discover] Not on dashboard, re-logging in. URL: ${currentUrl}`);
-            const relogged = await ensureLoggedIn(page);
-            if (!relogged) {
-              errors.push(`${brandKey}: Re-login failed`);
-              continue;
-            }
-          }
-
-          await assertNotBlocked(page, `discover-${brandKey}`);
-
-          // Click brand logo
+          // Click brand via launchCatalog link
           const brandClicked = await selectBrand(page, brandKey);
           if (!brandClicked) {
-            logger.warn(`[Discover] Brand "${brandKey}" not found on dashboard`);
+            logger.warn(`[Discover] Brand "${brandKey}" not found`);
             continue;
           }
 
           // Wait for SPA to load
           await humanDelay(3000, 5000);
+          await assertNotBlocked(page, `discover-${brandKey}`);
 
-          // Check if we landed on the model table or the catalog SPA
-          const afterClickUrl = page.url();
-          logger.info(`[Discover] After clicking ${brandKey}: ${afterClickUrl}`);
-          await takeScreenshot(page, `discover-${brandKey}`);
-
-          // Try to find model entries
-          let models: string[] = [];
-
-          // Method 1: Look for "Modell" column header (SPA table)
-          try {
-            await page.locator('text=Modell').first().waitFor({ state: 'visible', timeout: 10000 });
-            models = await extractColumnEntries(page, 0);
-            logger.info(`[Discover] ${brandKey}: found ${models.length} models via table`);
-          } catch {
-            logger.info(`[Discover] ${brandKey}: no "Modell" table, trying text extraction`);
-          }
-
-          // Method 2: Extract model-like text from the page
-          if (models.length === 0) {
-            const pageText = await page.locator('body').innerText({ timeout: 8000 });
-            const lines = pageText.split('\n');
-            const seen = new Set<string>();
-
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (trimmed.length < 3 || trimmed.length > 60) continue;
-              // Skip UI elements
-              if (/^(Modell|Modelljahr|Einschränkung|Hauptgruppe|Startseite|Abmelden|Login|Direkteinstieg|Teile suchen|Händler wählen|GO|partslink)/i.test(trimmed)) continue;
-              // Model names start with the brand name or a letter/number
-              if (/^[A-Za-zÀ-ÿ0-9]/.test(trimmed) && !seen.has(trimmed.toLowerCase())) {
-                // Check if this looks like a car model (contains brand name or common model patterns)
-                const brandNames = BRAND_MAP[brandKey] || [brandKey];
-                const isModel = brandNames.some(bn => trimmed.toLowerCase().includes(bn.toLowerCase())) ||
-                                /^\d{1,3}\s/.test(trimmed) || // "3er", "100", "A3"
-                                /^[A-Z][A-Za-z0-9\-/ ]{1,30}$/.test(trimmed);
-                if (isModel) {
-                  seen.add(trimmed.toLowerCase());
-                  models.push(trimmed);
-                }
-              }
-            }
-          }
+          // Read model names from _value_ spans
+          const values = await readValueSpans(page);
+          const models = values.filter(v =>
+            v.length > 3 && v.length < 50 &&
+            !/^(Modell|Modelljahr|Einschränkung|Hauptgruppe|Startseite|Direkteinstieg)/.test(v) &&
+            !/^\d{4}$/.test(v) && // Not a year
+            !/^\d{1,2}$/.test(v) // Not a HG code
+          );
 
           if (models.length > 0) {
             discoveredBrands.push(brandKey);
@@ -202,27 +193,22 @@ export async function discoverBrandsAndModels(): Promise<{
               try {
                 upsertVehicle({
                   vin: `PL24-${brandKey}-${model.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 30)}`,
-                  brand: brandKey,
-                  model,
+                  brand: brandKey, model,
                 });
-              } catch { /* duplicate */ }
+              } catch { /* dup */ }
             }
-            logger.info(`[Discover] ${brandKey}: ${models.length} models saved`);
-          } else {
-            logger.warn(`[Discover] ${brandKey}: no models found`);
+            logger.info(`[Discover] ${brandKey}: ${models.length} models`);
           }
 
         } catch (err: any) {
-          logger.error(`[Discover] ${brandKey} failed: ${err.message}`);
+          logger.error(`[Discover] ${brandKey}: ${err.message}`);
           errors.push(`${brandKey}: ${err.message}`);
         }
 
         await sleep(config.bulkDelayMs);
       }
 
-      logger.info(`[Discover] Complete: ${discoveredBrands.length} brands, ${allModels.length} models`);
       return { brands: discoveredBrands, models: allModels, errors };
-
     } finally {
       await page.close();
     }
@@ -230,7 +216,7 @@ export async function discoverBrandsAndModels(): Promise<{
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CRAWL MODE — Navigate catalog tree for a vehicle/model
+// CRAWL MODE
 // ═══════════════════════════════════════════════════════════════════════════
 
 export async function startCrawl(jobId: number): Promise<void> {
@@ -239,7 +225,6 @@ export async function startCrawl(jobId: number): Promise<void> {
 
   if (bulkRunning) {
     updateJobStatus(jobId, 'queued');
-    logger.info(`[BulkCrawler] Job ${jobId} queued — another job is running`);
     return;
   }
 
@@ -247,81 +232,58 @@ export async function startCrawl(jobId: number): Promise<void> {
   bulkPaused = false;
   currentJobId = jobId;
   consecutiveErrors = 0;
-
-  logger.info(`[BulkCrawler] Starting crawl for ${job.brand} ${job.model}`);
   updateJobStatus(jobId, 'running');
 
   try {
     await crawlVehicle(job);
   } catch (err: any) {
-    logger.error(`[BulkCrawler] Fatal error in job ${jobId}`, { error: err.message });
+    logger.error(`[Crawler] Fatal: ${err.message}`);
     updateJobStatus(jobId, 'failed', { last_error: err.message });
   } finally {
     bulkRunning = false;
     currentJobId = null;
-
     const next = getNextQueuedJob();
-    if (next) {
-      logger.info(`[BulkCrawler] Auto-starting next queued job: ${next.id}`);
-      startCrawl(next.id).catch(err => {
-        logger.error(`[BulkCrawler] Failed to start next job`, { error: err.message });
-      });
-    }
+    if (next) startCrawl(next.id).catch(() => {});
   }
 }
 
 async function crawlVehicle(job: BulkJob): Promise<void> {
-  const existingProgress = getJobProgress(job.id);
+  const progress = getJobProgress(job.id);
 
-  if (existingProgress.total === 0) {
-    // Fresh job — need to discover all Modelljahr × Einschränkung × HG × Bildtafel combinations
-    // Step 1: Navigate to model, get all years
-    logger.info(`[BulkCrawler] Phase 1: Discovering catalog structure for ${job.brand} ${job.model}...`);
-
-    const structure = await discoverCatalogStructure(job);
-    if (structure.length === 0) {
-      updateJobStatus(job.id, 'failed', { last_error: 'No catalog entries found' });
+  if (progress.total === 0) {
+    // Phase 1: Discover all Bildtafeln for this model
+    logger.info(`[Crawler] Discovering Bildtafeln for ${job.brand} ${job.model}...`);
+    const nodes = await discoverBildtafeln(job);
+    if (nodes.length === 0) {
+      updateJobStatus(job.id, 'failed', { last_error: 'No Bildtafeln found' });
       return;
     }
-
-    // Seed all Bildtafel entries as progress nodes
-    seedProgress(job.id, structure);
-    updateJobStatus(job.id, 'running', { total_hg: structure.length });
-    logger.info(`[BulkCrawler] Seeded ${structure.length} Bildtafel nodes to process`);
-  } else {
-    logger.info(`[BulkCrawler] Resuming job ${job.id} — ${existingProgress.pending} nodes pending`);
+    seedProgress(job.id, nodes);
+    updateJobStatus(job.id, 'running', { total_hg: nodes.length });
+    logger.info(`[Crawler] ${nodes.length} Bildtafeln to scrape`);
   }
 
-  // Phase 2: Process each Bildtafel node
+  // Phase 2: Process each Bildtafel
   while (true) {
-    if (bulkPaused) {
-      updateJobStatus(job.id, 'paused');
-      logger.info(`[BulkCrawler] Job ${job.id} paused`);
-      return;
-    }
+    if (bulkPaused) { updateJobStatus(job.id, 'paused'); return; }
 
     const node = getNextPendingNode(job.id);
     if (!node) {
       updateJobStatus(job.id, 'completed');
-      logger.info(`[BulkCrawler] Job ${job.id} completed! Parts: ${getJob(job.id)?.total_parts_found || 0}`);
+      logger.info(`[Crawler] Job ${job.id} done! ${getJob(job.id)?.total_parts_found || 0} OEMs`);
       return;
     }
 
     try {
-      await processNode(job, node);
+      await scrapeBildtafel(job, node);
       consecutiveErrors = 0;
     } catch (err: any) {
       consecutiveErrors++;
-      logger.error(`[BulkCrawler] Node error (${consecutiveErrors}/${config.bulkMaxConsecutiveErrors})`, {
-        node: `${node.hg_code}/${node.fg_code}/${node.bildtafel_id}`, error: err.message,
-      });
-
       markNodeFailed(node.id, err.message);
       incrementJobErrors(job.id);
-
       if (consecutiveErrors >= config.bulkMaxConsecutiveErrors) {
         updateJobStatus(job.id, 'paused', {
-          last_error: `${consecutiveErrors} consecutive errors — auto-paused. Last: ${err.message}`,
+          last_error: `${consecutiveErrors} errors — auto-paused: ${err.message}`,
         });
         return;
       }
@@ -331,307 +293,224 @@ async function crawlVehicle(job: BulkJob): Promise<void> {
   }
 }
 
-// ── Discover Catalog Structure ───────────────────────────────────────────────
-// Navigate: Brand → Model → get all Years → for each Year, get Einschränkungen →
-// for each path, get HG list → for each HG, get Bildtafel list
+// ── Discover Bildtafeln ──────────────────────────────────────────────────────
 
-async function discoverCatalogStructure(job: BulkJob): Promise<Array<{
+async function discoverBildtafeln(job: BulkJob): Promise<Array<{
   hg_code: string; hg_name?: string; fg_code?: string; fg_name?: string; bildtafel_id?: string;
 }>> {
   return enqueue(async () => {
     const ctx = getContext();
     if (!ctx) throw new Error('Browser not initialized');
-
     const page = await ctx.newPage();
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
     try {
-      // Use navigateToCatalog which handles login + dashboard verification
-      await navigateToCatalog(page, job);
+      // Navigate to HG page: Login → Dashboard → Brand → Model → Year
+      await navigateToHgPage(page, job);
 
-      // Click model in the table
-      const modelClicked = await clickTableEntry(page, job.model);
-      if (!modelClicked) throw new Error(`Model "${job.model}" not found in table`);
-      await humanDelay(2000, 3000);
-
-      // Get all years from the Modelljahr column
-      const years = await extractColumnEntries(page, 1);
-      logger.info(`[BulkCrawler] ${job.model}: ${years.length} years found`);
-
-      if (years.length === 0) {
-        // Maybe we jumped directly to HG (no year selection needed)
-        return await extractHgAndBildtafeln(page, job);
+      // Read all HG entries
+      const values = await readValueSpans(page);
+      const hgEntries: Array<{ code: string; name: string }> = [];
+      for (const v of values) {
+        const match = v.match(/^(\d)\s+(.+)/);
+        if (match) hgEntries.push({ code: match[1], name: match[2] });
       }
-
-      // For now, pick the most recent year to start (we can expand later)
-      // Sort years descending, take the first one
-      const sortedYears = years.sort((a, b) => parseInt(b) - parseInt(a));
-      const targetYear = sortedYears[0];
-
-      logger.info(`[BulkCrawler] Using year ${targetYear} for ${job.model}`);
-
-      // Click the year
-      const yearClicked = await clickTableEntry(page, targetYear);
-      if (!yearClicked) throw new Error(`Year "${targetYear}" not found`);
-      await humanDelay(2000, 3000);
-
-      // Check for Einschränkung columns
-      const einschraenkungen = await extractColumnEntries(page, 2);
-      if (einschraenkungen.length > 0) {
-        logger.info(`[BulkCrawler] Einschränkungen: ${einschraenkungen.join(', ')}`);
-        // Click first Einschränkung (e.g. "Frontantrieb")
-        await clickTableEntry(page, einschraenkungen[0]);
-        await humanDelay(2000, 3000);
-
-        // Check for further Einschränkung II
-        const einschr2 = await extractColumnEntries(page, 3);
-        if (einschr2.length > 0) {
-          await clickTableEntry(page, einschr2[0]);
-          await humanDelay(2000, 3000);
+      // Fallback: match known HG names
+      if (hgEntries.length === 0) {
+        const knownNames = ['Motor', 'Kraftstoff', 'Getriebe', 'Vorderachse', 'Hinterachse',
+          'Räder', 'Hebelwerk', 'Karosserie', 'Elektrik', 'Zubehör'];
+        let code = 1;
+        for (const v of values) {
+          if (knownNames.some(n => v.includes(n))) {
+            hgEntries.push({ code: String(code % 10), name: v });
+            code++;
+          }
         }
       }
 
-      // Now we should be at the Hauptgruppe page
-      return await extractHgAndBildtafeln(page, job);
+      logger.info(`[Crawler] Found ${hgEntries.length} HG entries`);
+      const allNodes: Array<{ hg_code: string; hg_name?: string; fg_code?: string; fg_name?: string; bildtafel_id?: string }> = [];
 
+      // For each HG, click it and read Bildtafeln
+      for (const hg of hgEntries) {
+        try {
+          const clicked = await clickValueSpan(page, hg.name);
+          if (!clicked) {
+            allNodes.push({ hg_code: hg.code, hg_name: hg.name });
+            continue;
+          }
+          await humanDelay(2000, 3000);
+
+          // Read Bildtafel entries (format XXX-YYY)
+          const btValues = await readValueSpans(page);
+          const bildtafeln: Array<{ bt: string; ug: string; name: string }> = [];
+          for (let i = 0; i < btValues.length; i++) {
+            if (/^\d{3}-\d{3}$/.test(btValues[i])) {
+              const ug = (i > 0 && /^\d{2}$/.test(btValues[i - 1])) ? btValues[i - 1] : '00';
+              const name = (i + 1 < btValues.length) ? btValues[i + 1] : '';
+              bildtafeln.push({ bt: btValues[i], ug, name });
+            }
+          }
+
+          if (bildtafeln.length > 0) {
+            for (const bt of bildtafeln) {
+              allNodes.push({
+                hg_code: hg.code, hg_name: hg.name,
+                fg_code: bt.ug, fg_name: bt.name,
+                bildtafel_id: bt.bt,
+              });
+            }
+            logger.info(`[Crawler] HG ${hg.code} ${hg.name}: ${bildtafeln.length} Bildtafeln`);
+          } else {
+            allNodes.push({ hg_code: hg.code, hg_name: hg.name });
+          }
+
+          // Click back to HG level (click HG name in sidebar or use breadcrumb)
+          // The HG sidebar stays visible — we just need to click another HG
+        } catch (err: any) {
+          logger.warn(`[Crawler] HG ${hg.code}: ${err.message}`);
+          allNodes.push({ hg_code: hg.code, hg_name: hg.name });
+        }
+      }
+
+      return allNodes;
     } finally {
       await page.close();
     }
-  }, `discover-structure-${job.id}`, 'low');
+  }, `discover-bt-${job.id}`, 'low');
 }
 
-/**
- * Extract HG list from the Hauptgruppe page, then for each HG click into it
- * and extract all Bildtafel entries. Returns flat list of all Bildtafel nodes.
- */
-async function extractHgAndBildtafeln(page: Page, job: BulkJob): Promise<Array<{
-  hg_code: string; hg_name?: string; fg_code?: string; fg_name?: string; bildtafel_id?: string;
-}>> {
-  const allNodes: Array<{
-    hg_code: string; hg_name?: string; fg_code?: string; fg_name?: string; bildtafel_id?: string;
-  }> = [];
+// ── Navigate to HG Page ──────────────────────────────────────────────────────
 
-  // Wait for Hauptgruppe table
-  try {
-    await page.locator('text=Hauptgruppe').first().waitFor({ state: 'visible', timeout: 10000 });
-  } catch {
-    logger.warn('[BulkCrawler] Hauptgruppe header not visible');
-    await takeScreenshot(page, `no-hg-${job.brand}-${job.model}`);
-    return [];
-  }
+async function navigateToHgPage(page: Page, job: BulkJob): Promise<void> {
+  // Step 1: Login
+  const loggedIn = await ensureLoggedIn(page);
+  if (!loggedIn) throw new Error('Login failed');
 
-  // Extract HG entries from the left sidebar
-  // PL24 format: "1  Motor", "2  Kraftstoff,Abgas,Kühlung", etc.
-  // SINGLE digit HG codes (0-9)
-  const hgEntries = await scrapeHauptgruppen(page);
-  logger.info(`[BulkCrawler] Found ${hgEntries.length} Hauptgruppen`);
+  // Step 2: Go to dashboard
+  await page.goto('https://www.partslink24.com/partslink24/user/brandMenu.do', {
+    waitUntil: 'domcontentloaded', timeout: 30000,
+  });
+  await waitForStable(page);
+  await humanDelay(2000, 3000);
 
-  for (const hg of hgEntries) {
-    // Click into each HG to get its Bildtafel list
-    try {
-      const clicked = await clickSidebarHg(page, hg.code, hg.name);
-      if (!clicked) {
-        // Add HG as a single node to process later
-        allNodes.push({ hg_code: hg.code, hg_name: hg.name });
-        continue;
-      }
+  // Step 3: Click brand
+  const brandClicked = await selectBrand(page, job.brand);
+  if (!brandClicked) throw new Error(`Brand "${job.brand}" not found`);
+  await humanDelay(3000, 5000);
 
+  // Step 4: Click model in SPA table
+  const modelClicked = await clickValueSpan(page, job.model);
+  if (!modelClicked) throw new Error(`Model "${job.model}" not found`);
+  await humanDelay(2000, 3000);
+
+  // Step 5: Check if we have years or jumped directly to HG
+  const values = await readValueSpans(page);
+  const hasYears = values.some(v => /^\d{4}$/.test(v));
+
+  if (hasYears) {
+    // Pick most recent year
+    const years = values.filter(v => /^\d{4}$/.test(v)).sort((a, b) => parseInt(b) - parseInt(a));
+    if (years.length > 0) {
+      await clickValueSpan(page, years[0]);
       await humanDelay(2000, 3000);
 
-      // Extract Bildtafel entries from the table
-      // Format: Untergruppe | Bildtafel | Benennung | Bemerkung | Modellangabe
-      const bildtafeln = await scrapeBildtafelList(page);
+      // Check for Einschränkungen
+      const newValues = await readValueSpans(page);
+      const hasHg = newValues.some(v => /^(Motor|Kraftstoff|Getriebe|Vorderachse|Hinterachse|Räder|Hebelwerk|Karosserie|Elektrik|Zubehör)/.test(v));
 
-      if (bildtafeln.length > 0) {
-        for (const bt of bildtafeln) {
-          allNodes.push({
-            hg_code: hg.code,
-            hg_name: hg.name,
-            fg_code: bt.untergruppe,
-            fg_name: bt.benennung,
-            bildtafel_id: bt.bildtafel,
-          });
+      if (!hasHg) {
+        // Still in drill-down — click first available option
+        const options = newValues.filter(v =>
+          v.length > 3 && !/^\d{4}$/.test(v) &&
+          !/^(Modell|Hauptgruppe|Einschränkung)/.test(v)
+        );
+        if (options.length > 0) {
+          await clickValueSpan(page, options[0]);
+          await humanDelay(2000, 3000);
         }
-        logger.info(`[BulkCrawler] HG ${hg.code} ${hg.name}: ${bildtafeln.length} Bildtafeln`);
-      } else {
-        // No Bildtafeln found — add HG as a node
-        allNodes.push({ hg_code: hg.code, hg_name: hg.name });
       }
-
-    } catch (err: any) {
-      logger.warn(`[BulkCrawler] Error processing HG ${hg.code}: ${err.message}`);
-      allNodes.push({ hg_code: hg.code, hg_name: hg.name });
     }
   }
 
-  return allNodes;
-}
-
-// ── Scrape Hauptgruppen (Single digit 0-9) ───────────────────────────────────
-
-async function scrapeHauptgruppen(page: Page): Promise<Array<{ code: string; name: string }>> {
-  const entries: Array<{ code: string; name: string }> = [];
-
-  try {
-    // PL24 HG sidebar: clickable items like "1  Motor", "2  Kraftstoff,Abgas,Kühlung"
-    // The HG code is a SINGLE digit (0-9)
-    const bodyText = await page.locator('body').innerText({ timeout: 10000 });
-    const lines = bodyText.split('\n');
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      // Match: single digit + space(s) + name
-      // "1  Motor" or "0  Zubehör,Infotainment,Sonstiges"
-      const match = trimmed.match(/^(\d)\s{1,}([A-Za-zÀ-ÿ].{2,})$/);
-      if (match) {
-        entries.push({ code: match[1], name: match[2].trim() });
-      }
-    }
-
-    // Fallback: look for specific known HG names
-    if (entries.length === 0) {
-      const knownHgs = [
-        { code: '1', name: 'Motor' },
-        { code: '2', name: 'Kraftstoff,Abgas,Kühlung' },
-        { code: '3', name: 'Getriebe' },
-        { code: '4', name: 'Vorderachse,Lenkung' },
-        { code: '5', name: 'Hinterachse' },
-        { code: '6', name: 'Räder,Bremsen' },
-        { code: '7', name: 'Hebelwerk' },
-        { code: '8', name: 'Karosserie' },
-        { code: '9', name: 'Elektrik' },
-        { code: '0', name: 'Zubehör,Infotainment,Sonstiges' },
-      ];
-
-      for (const hg of knownHgs) {
-        try {
-          const el = page.locator(`text="${hg.name}"`).first();
-          if (await el.isVisible({ timeout: 1000 })) {
-            entries.push(hg);
-          }
-        } catch { /* skip */ }
-      }
-    }
-  } catch (err: any) {
-    logger.error('[BulkCrawler] Failed to scrape HG', { error: err.message });
+  // Verify we're on HG page
+  const finalValues = await readValueSpans(page);
+  const hasHg = finalValues.some(v => /^(Motor|Kraftstoff|Getriebe|Vorderachse|Hinterachse|Räder|Hebelwerk|Karosserie|Elektrik|Zubehör)/.test(v));
+  if (!hasHg) {
+    await takeScreenshot(page, `no-hg-${job.brand}-${job.model}`);
+    logger.warn(`[Crawler] HG page not detected for ${job.brand} ${job.model}`);
   }
-
-  // Deduplicate
-  const seen = new Set<string>();
-  return entries.filter(e => {
-    if (seen.has(e.code)) return false;
-    seen.add(e.code);
-    return true;
-  });
 }
 
-// ── Scrape Bildtafel List ────────────────────────────────────────────────────
-// After clicking a HG, the main area shows:
-// Untergruppe | Bildtafel | Benennung | Bemerkung | Modellangabe
-// 00          | 100-005   | Rumpfmotor | 2,0Ltr.  | 4-Zylinder
-// 00          | 500-000   | Hinterachsgetriebe | Ölbefüllt |
+// ── Scrape Single Bildtafel ──────────────────────────────────────────────────
 
-async function scrapeBildtafelList(page: Page): Promise<Array<{
-  untergruppe: string; bildtafel: string; benennung: string;
-}>> {
-  const entries: Array<{ untergruppe: string; bildtafel: string; benennung: string }> = [];
-
-  try {
-    const bodyText = await page.locator('body').innerText({ timeout: 8000 });
-    const lines = bodyText.split('\n');
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      // Match: UG (2 digits) + Bildtafel (XXX-YYY) + Benennung
-      // "00	100-005	Rumpfmotor	2,0Ltr.	4-Zylinder"
-      const match = trimmed.match(/^(\d{2})\s+(\d{3}-\d{3})\s+(.+)/);
-      if (match) {
-        const benennung = match[3].split(/\t/)[0].trim(); // First part before tab
-        entries.push({
-          untergruppe: match[1],
-          bildtafel: match[2],
-          benennung,
-        });
-      }
-    }
-
-    // Fallback: try extracting from table rows
-    if (entries.length === 0) {
-      const rows = await page.locator('tr, [role="row"]').all();
-      for (const row of rows) {
-        try {
-          const cells = await row.locator('td, [role="cell"]').all();
-          if (cells.length >= 3) {
-            const ug = (await cells[0].innerText({ timeout: 500 })).trim();
-            const bt = (await cells[1].innerText({ timeout: 500 })).trim();
-            const name = (await cells[2].innerText({ timeout: 500 })).trim();
-
-            if (/^\d{2}$/.test(ug) && /^\d{3}-\d{3}$/.test(bt)) {
-              entries.push({ untergruppe: ug, bildtafel: bt, benennung: name });
-            }
-          }
-        } catch { /* skip */ }
-      }
-    }
-  } catch (err: any) {
-    logger.warn('[BulkCrawler] Failed to scrape Bildtafel list', { error: err.message });
-  }
-
-  return entries;
-}
-
-// ── Process Single Bildtafel Node ────────────────────────────────────────────
-
-async function processNode(job: BulkJob, node: BulkProgressEntry): Promise<void> {
-  const nodeLabel = `HG:${node.hg_code}|UG:${node.fg_code || '-'}|BT:${node.bildtafel_id || '-'}`;
-  logger.info(`[BulkCrawler] Processing ${nodeLabel}`);
-
+async function scrapeBildtafel(job: BulkJob, node: BulkProgressEntry): Promise<void> {
   await enqueue(async () => {
     const ctx = getContext();
     if (!ctx) throw new Error('Browser not initialized');
-
     const page = await ctx.newPage();
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
     try {
-      const loggedIn = await ensureLoggedIn(page);
-      if (!loggedIn) throw new Error('Login failed');
+      // Navigate to the HG page
+      await navigateToHgPage(page, job);
 
-      // Navigate to the correct position: Brand → Model → Year → HG → Bildtafel
-      await navigateToCatalog(page, job);
-
-      // Click the HG in sidebar
-      const hgClicked = await clickSidebarHg(page, node.hg_code, node.hg_name);
-      if (!hgClicked) {
-        markNodeComplete(node.id, 0);
-        return;
+      // Click into the correct HG
+      if (node.hg_name) {
+        const hgClicked = await clickValueSpan(page, node.hg_name);
+        if (!hgClicked) { markNodeComplete(node.id, 0); return; }
+        await humanDelay(2000, 3000);
       }
-      await humanDelay(2000, 3000);
 
+      // Click the Bildtafel
       if (node.bildtafel_id) {
-        // Click into the specific Bildtafel
-        const btClicked = await clickBildtafel(page, node.bildtafel_id);
+        // Click the Bildtafel row — need to find the XXX-YYY span and click its parent row
+        const btClicked = await page.evaluate((btId) => {
+          const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+          for (const s of spans) {
+            if (s.textContent?.trim() === btId) {
+              // Click the parent row element
+              const row = s.closest('[class*="_row_"], [class*="_line_"], [class*="Row"]') || s.parentElement?.parentElement;
+              if (row) { (row as HTMLElement).click(); return true; }
+              (s as HTMLElement).click();
+              return true;
+            }
+          }
+          return false;
+        }, node.bildtafel_id);
+
         if (!btClicked) {
-          markNodeComplete(node.id, 0);
-          return;
+          // Fallback: try clicking by text
+          const fallback = await clickValueSpan(page, node.bildtafel_id);
+          if (!fallback) { markNodeComplete(node.id, 0); return; }
         }
-        await humanDelay(2000, 4000);
-        await assertNotBlocked(page, `bulk-${nodeLabel}`);
 
-        // Extract OEM numbers from the Bildtafel page
-        const parts = await extractOemFromBildtafel(page, job, node);
-        const inserted = parts.length > 0 ? insertResults(job.id, parts) : 0;
+        await humanDelay(3000, 5000);
+        await assertNotBlocked(page, `bt-${node.bildtafel_id}`);
 
-        if (inserted > 0) incrementJobParts(job.id, inserted);
-        markNodeComplete(node.id, inserted);
+        // Extract OEMs
+        const oems = await extractOemsFromPage(page);
+
+        if (oems.length > 0) {
+          const rows = oems.map(o => ({
+            vin: job.vin, brand: job.brand, model: job.model,
+            oem: o.oem, description: o.description,
+            bildtafel: node.bildtafel_id || undefined,
+            hg_code: node.hg_code, hg_name: node.hg_name || undefined,
+            fg_code: node.fg_code || undefined, fg_name: node.fg_name || undefined,
+          }));
+          const inserted = insertResults(job.id, rows);
+          incrementJobParts(job.id, inserted);
+          logger.info(`[Crawler] BT ${node.bildtafel_id}: ${inserted} OEMs`);
+        }
+
+        markNodeComplete(node.id, oems.length);
         incrementJobCompletedHg(job.id);
-        logger.info(`[BulkCrawler] ${nodeLabel}: ${inserted} OEMs extracted`);
       } else {
-        // No Bildtafel — this is an HG-only node, try to extract what's there
         markNodeComplete(node.id, 0);
         incrementJobCompletedHg(job.id);
       }
@@ -641,366 +520,8 @@ async function processNode(job: BulkJob, node: BulkProgressEntry): Promise<void>
         last_fg: node.fg_code || undefined,
         last_bildtafel: node.bildtafel_id || undefined,
       });
-
     } finally {
       await page.close();
     }
-  }, `bulk-node-${nodeLabel}`, 'low');
-}
-
-// ── Navigate to Catalog (Brand → Model → Year → Einschränkung) ──────────────
-
-async function navigateToCatalog(page: Page, job: BulkJob): Promise<void> {
-  // Login first (this navigates to PL24 and logs in if needed)
-  const loggedIn = await ensureLoggedIn(page);
-  if (!loggedIn) throw new Error('Login failed');
-
-  // Now we're on the dashboard — navigate to it to ensure clean state
-  await page.goto('https://www.partslink24.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await waitForStable(page);
-  await humanDelay(2000, 3000);
-
-  // Verify we're on the dashboard
-  const bodyText = await page.locator('body').innerText({ timeout: 5000 });
-  const onDashboard = bodyText.toLowerCase().includes('abmelden') ||
-                      bodyText.toLowerCase().includes('herzlich willkommen');
-  if (!onDashboard) {
-    logger.warn('[BulkCrawler] Not on dashboard after navigation, trying re-login');
-    const relogged = await ensureLoggedIn(page);
-    if (!relogged) throw new Error('Re-login failed');
-    // After re-login, page should be on dashboard
-  }
-
-  // Click brand
-  const brandClicked = await selectBrand(page, job.brand);
-  if (!brandClicked) throw new Error(`Brand "${job.brand}" not found`);
-  await humanDelay(3000, 5000);
-
-  // Wait for model table
-  try {
-    await page.locator('text=Modell').first().waitFor({ state: 'visible', timeout: 15000 });
-  } catch {
-    throw new Error('Model table did not appear after brand click');
-  }
-
-  // Click model
-  const modelClicked = await clickTableEntry(page, job.model);
-  if (!modelClicked) throw new Error(`Model "${job.model}" not found`);
-  await humanDelay(2000, 3000);
-
-  // Check if we have years → click first available
-  const years = await extractColumnEntries(page, 1);
-  if (years.length > 0) {
-    // Pick most recent year
-    const sortedYears = years.sort((a, b) => parseInt(b) - parseInt(a));
-    await clickTableEntry(page, sortedYears[0]);
-    await humanDelay(2000, 3000);
-
-    // Handle Einschränkungen
-    const einschr1 = await extractColumnEntries(page, 2);
-    if (einschr1.length > 0) {
-      await clickTableEntry(page, einschr1[0]);
-      await humanDelay(1500, 2500);
-
-      const einschr2 = await extractColumnEntries(page, 3);
-      if (einschr2.length > 0) {
-        await clickTableEntry(page, einschr2[0]);
-        await humanDelay(1500, 2500);
-      }
-    }
-  }
-
-  // Wait for Hauptgruppe page to load
-  try {
-    await page.locator('text=Hauptgruppe').first().waitFor({ state: 'visible', timeout: 15000 });
-  } catch {
-    // Might already be on a different view
-    logger.warn('[BulkCrawler] Hauptgruppe header not visible after navigation');
-  }
-}
-
-// ── Extract OEM Numbers from Bildtafel Page ──────────────────────────────────
-// Table format: Pos. | Teilenummer | Benennung | Bemerkung | Stk. | Modellangabe
-// "1 | 0B0 500 043 R | Hinterachsgetriebe | 44:10 | 1"
-
-async function extractOemFromBildtafel(page: Page, job: BulkJob, node: BulkProgressEntry): Promise<Array<{
-  vin: string; brand: string; model: string;
-  oem: string; description?: string; bildtafel?: string;
-  hg_code?: string; hg_name?: string; fg_code?: string; fg_name?: string;
-}>> {
-  const parts: Array<{
-    vin: string; brand: string; model: string;
-    oem: string; description?: string; bildtafel?: string;
-    hg_code?: string; hg_name?: string; fg_code?: string; fg_name?: string;
-  }> = [];
-
-  try {
-    // Wait for parts table to load
-    try {
-      await page.locator('text=Teilenummer').first().waitFor({ state: 'visible', timeout: 10000 });
-    } catch {
-      logger.warn(`[BulkCrawler] "Teilenummer" not visible for BT ${node.bildtafel_id}`);
-      return [];
-    }
-
-    const bodyText = await page.locator('body').innerText({ timeout: 10000 });
-    const lines = bodyText.split('\n');
-    const seenOems = new Set<string>();
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-
-      // Look for OEM patterns in the text
-      // VAG format: "0B0 500 043 R", "09R 500 043 E", "4K0 501 529 F"
-      // BMW format: "11 42 7 508 966"
-      // Mercedes: "A 205 421 10 12"
-      const oemPatterns = [
-        /\b([A-Z0-9]{3}\s\d{3}\s\d{3}\s?[A-Z]?)\b/g,           // VAG: 0B0 500 043 R
-        /\b(\d{2}\s\d{2}\s\d\s\d{3}\s\d{3})\b/g,                 // BMW: 11 42 7 508 966
-        /\b([A-Z]\s?\d{3}\s?\d{3}\s?\d{2}\s?\d{2})\b/g,          // Mercedes
-        /\b([A-Z0-9]{2,4}[\s.-]?\d{3}[\s.-]?\d{3}[\s.-]?[A-Z0-9]{0,3})\b/g, // Generic
-      ];
-
-      for (const pattern of oemPatterns) {
-        let match;
-        while ((match = pattern.exec(trimmed)) !== null) {
-          const oem = match[1].trim();
-          const normalized = oem.replace(/[\s\-.]/g, '');
-
-          // Validate: must have digits, must be 7-15 chars
-          if (normalized.length >= 7 && normalized.length <= 15 && /\d/.test(normalized) && !seenOems.has(normalized)) {
-            seenOems.add(normalized);
-
-            // Try to find description near the OEM number
-            const oemIdx = trimmed.indexOf(oem);
-            const afterOem = trimmed.substring(oemIdx + oem.length).trim();
-            const description = afterOem.split(/\t|\s{3,}/)[0]?.trim() || '';
-
-            parts.push({
-              vin: job.vin,
-              brand: job.brand,
-              model: job.model,
-              oem,
-              description: description || node.fg_name || undefined,
-              bildtafel: node.bildtafel_id || undefined,
-              hg_code: node.hg_code,
-              hg_name: node.hg_name || undefined,
-              fg_code: node.fg_code || undefined,
-              fg_name: node.fg_name || undefined,
-            });
-          }
-        }
-      }
-    }
-
-    // Also try structured table extraction
-    if (parts.length === 0) {
-      const rows = await page.locator('tr, [role="row"]').all();
-      for (const row of rows) {
-        try {
-          const cells = await row.locator('td, [role="cell"]').all();
-          if (cells.length >= 3) {
-            // Look for "Teilenummer" column (usually index 1 or 2)
-            for (let i = 0; i < Math.min(cells.length, 4); i++) {
-              const cellText = (await cells[i].innerText({ timeout: 500 })).trim();
-              const normalized = cellText.replace(/[\s\-.]/g, '');
-
-              if (normalized.length >= 7 && normalized.length <= 15 && /\d/.test(normalized) && /[A-Z]/.test(cellText)) {
-                if (!seenOems.has(normalized)) {
-                  seenOems.add(normalized);
-
-                  // Get description from next cell
-                  let desc = '';
-                  if (i + 1 < cells.length) {
-                    desc = (await cells[i + 1].innerText({ timeout: 500 })).trim();
-                  }
-
-                  parts.push({
-                    vin: job.vin,
-                    brand: job.brand,
-                    model: job.model,
-                    oem: cellText,
-                    description: desc || node.fg_name || undefined,
-                    bildtafel: node.bildtafel_id || undefined,
-                    hg_code: node.hg_code,
-                    hg_name: node.hg_name || undefined,
-                    fg_code: node.fg_code || undefined,
-                    fg_name: node.fg_name || undefined,
-                  });
-                }
-              }
-            }
-          }
-        } catch { /* skip */ }
-      }
-    }
-  } catch (err: any) {
-    logger.warn(`[BulkCrawler] OEM extraction failed for BT ${node.bildtafel_id}`, { error: err.message });
-  }
-
-  return parts;
-}
-
-// ── Table Navigation Helpers ─────────────────────────────────────────────────
-
-/**
- * Extract text entries from a specific column index in the PL24 multi-column table.
- * Column 0 = Modell, 1 = Modelljahr, 2 = Einschränkung I, etc.
- */
-async function extractColumnEntries(page: Page, columnIndex: number): Promise<string[]> {
-  const entries: string[] = [];
-  const seen = new Set<string>();
-
-  try {
-    // PL24 SPA uses a table/grid layout
-    // Try to find column headers first to identify the right column
-    const headers = await page.locator('th, [role="columnheader"]').all();
-    let targetHeader: string | null = null;
-
-    if (headers.length > columnIndex) {
-      try {
-        targetHeader = (await headers[columnIndex].innerText({ timeout: 2000 })).trim();
-      } catch { /* ignore */ }
-    }
-
-    // Extract entries from table rows
-    const rows = await page.locator('tr, [role="row"]').all();
-    for (const row of rows) {
-      try {
-        const cells = await row.locator('td, [role="cell"]').all();
-        if (cells.length > columnIndex) {
-          const text = (await cells[columnIndex].innerText({ timeout: 500 })).trim();
-          if (text && text.length > 0 && text.length < 100 && !seen.has(text)) {
-            seen.add(text);
-            entries.push(text);
-          }
-        }
-      } catch { /* skip */ }
-    }
-
-    // Fallback: parse body text and look for the column entries
-    if (entries.length === 0) {
-      const bodyText = await page.locator('body').innerText({ timeout: 8000 });
-      const lines = bodyText.split('\n');
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.length >= 2 && trimmed.length <= 60 && !seen.has(trimmed)) {
-          // For Modelljahr column, look for 4-digit years
-          if (columnIndex === 1 && /^\d{4}$/.test(trimmed)) {
-            seen.add(trimmed);
-            entries.push(trimmed);
-          }
-          // For Modell column, look for model names
-          else if (columnIndex === 0 && /^[A-Za-zÀ-ÿ0-9]/.test(trimmed) && !/^(Modell|Modelljahr|Einschränkung|Hauptgruppe|Startseite)/.test(trimmed)) {
-            seen.add(trimmed);
-            entries.push(trimmed);
-          }
-          // For Einschränkung columns
-          else if (columnIndex >= 2 && /^[A-Za-zÀ-ÿ]/.test(trimmed) && trimmed.length >= 3) {
-            seen.add(trimmed);
-            entries.push(trimmed);
-          }
-        }
-      }
-    }
-  } catch (err: any) {
-    logger.warn(`[BulkCrawler] Failed to extract column ${columnIndex}`, { error: err.message });
-  }
-
-  return entries;
-}
-
-/**
- * Click an entry in the PL24 drill-down table by its text.
- */
-async function clickTableEntry(page: Page, text: string): Promise<boolean> {
-  const selectors = [
-    `td:has-text("${text}")`,
-    `[role="cell"]:has-text("${text}")`,
-    `a:has-text("${text}")`,
-    `text="${text}"`,
-    `div:has-text("${text}")`,
-  ];
-
-  for (const sel of selectors) {
-    try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 3000 })) {
-        await el.click();
-        await waitForStable(page);
-        await humanDelay(500, 1000);
-        return true;
-      }
-    } catch { /* try next */ }
-  }
-
-  logger.warn(`[BulkCrawler] Could not click table entry: "${text}"`);
-  return false;
-}
-
-/**
- * Click a Hauptgruppe in the sidebar.
- * PL24 sidebar has entries like "1  Motor", "2  Kraftstoff,Abgas,Kühlung"
- */
-async function clickSidebarHg(page: Page, hgCode: string, hgName: string | null): Promise<boolean> {
-  // Try clicking by name first (more reliable)
-  if (hgName) {
-    const nameSelectors = [
-      `text="${hgCode} ${hgName}"`,
-      `text="${hgName}"`,
-      `a:has-text("${hgName}")`,
-      `div:has-text("${hgName}")`,
-      `li:has-text("${hgName}")`,
-    ];
-
-    for (const sel of nameSelectors) {
-      try {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 2000 })) {
-          await el.click();
-          await waitForStable(page);
-          return true;
-        }
-      } catch { /* try next */ }
-    }
-  }
-
-  // Fallback: click by code
-  try {
-    const el = page.locator(`text="${hgCode}"`).first();
-    if (await el.isVisible({ timeout: 2000 })) {
-      await el.click();
-      await waitForStable(page);
-      return true;
-    }
-  } catch { /* skip */ }
-
-  return false;
-}
-
-/**
- * Click a Bildtafel entry by its ID (format: XXX-YYY, e.g., "100-005", "500-000")
- */
-async function clickBildtafel(page: Page, bildtafelId: string): Promise<boolean> {
-  const selectors = [
-    `td:has-text("${bildtafelId}")`,
-    `[role="cell"]:has-text("${bildtafelId}")`,
-    `a:has-text("${bildtafelId}")`,
-    `text="${bildtafelId}"`,
-  ];
-
-  for (const sel of selectors) {
-    try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 3000 })) {
-        await el.click();
-        await waitForStable(page);
-        return true;
-      }
-    } catch { /* try next */ }
-  }
-
-  logger.warn(`[BulkCrawler] Could not click Bildtafel: "${bildtafelId}"`);
-  return false;
+  }, `scrape-bt-${node.bildtafel_id || node.hg_code}`, 'low');
 }
