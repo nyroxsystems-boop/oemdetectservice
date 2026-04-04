@@ -19,7 +19,7 @@ import {
   createJob, getJob, getActiveJob, listJobs, updateJobStatus,
   getResults, getAllResultsForExport, getBulkStats, getJobProgress,
 } from './bulkStore';
-import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState } from './bulkCrawler';
+import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState, discoverBrandsAndModels } from './bulkCrawler';
 import { seedAllVins, getVinCount } from './vinSeeder';
 
 const app = express();
@@ -244,6 +244,20 @@ app.put('/api/bulk/vehicles/:id', (req: Request, res: Response) => {
   const updated = updateVehicle(id, req.body);
   if (!updated) return res.status(404).json({ error: 'Vehicle not found' });
   res.json({ success: true });
+});
+
+// Discover all brands & models directly from PartsLink24
+app.post('/api/bulk/discover', async (_req: Request, res: Response) => {
+  try {
+    logger.info('Starting PL24 brand/model discovery...');
+    const result = await discoverBrandsAndModels();
+    res.json({
+      success: true,
+      ...result,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/bulk/vehicles/seed', (_req: Request, res: Response) => {

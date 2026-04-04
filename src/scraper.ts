@@ -564,7 +564,9 @@ const BRAND_MAP: Record<string, string[]> = {
   ALPINE:      ['Alpine'],
 };
 
-async function selectBrand(page: Page, brand: string): Promise<boolean> {
+export { BRAND_MAP };
+
+export async function selectBrand(page: Page, brand: string): Promise<boolean> {
   const upper = brand.toUpperCase();
   const names = BRAND_MAP[upper] || [brand];
 
@@ -1229,7 +1231,7 @@ export async function waitForStable(page: Page, timeout: number = NAVIGATION_TIM
   await sleep(1000);
 }
 
-async function takeScreenshot(page: Page, name: string): Promise<void> {
+export async function takeScreenshot(page: Page, name: string): Promise<void> {
   try {
     const filepath = path.join(STORAGE_DIR, `${name}.png`);
     await page.screenshot({ path: filepath, fullPage: false });
