@@ -23,7 +23,7 @@ import {
   getJob, updateJobStatus, getNextPendingNode, seedProgress,
   markNodeComplete, markNodeFailed, insertResults,
   incrementJobParts, incrementJobErrors, incrementJobCompletedHg,
-  getNextQueuedJob, getJobProgress, upsertVehicle,
+  getNextQueuedJob, getJobProgress, upsertVehicle, createJob,
 } from './bulkStore';
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -383,6 +383,15 @@ export async function crawlSingleBrand(brand: string): Promise<{
     }
     logger.info('🔑 Login OK');
 
+    // ── Create vehicle + job for tracking ──
+    const vehicleVin = `PL24-${brand.toUpperCase()}-BRAND`;
+    const vehicleId = upsertVehicle({ vin: vehicleVin, brand: brand.toUpperCase(), model: `ALL (${brand})` });
+    const job = createJob(vehicleId);
+    const jobId = job.id;
+    currentJobId = jobId;
+    updateJobStatus(jobId, 'running');
+    logger.info(`📝 Created job #${jobId} for brand ${brand}`);
+
     // ── Step 2: Navigate to brand SPA ──
     const spaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/0?desktop=true&lang=de`;
     logger.info(`🌐 Navigating to: ${spaUrl}`);
@@ -567,9 +576,11 @@ export async function crawlSingleBrand(brand: string): Promise<{
                       fg_code: bt.ug, fg_name: bt.name,
                     }));
 
-                    // Insert directly into bulk_results (create a pseudo-job)
-                    totalOems += oems.length;
-                    logger.info(`    │ ✅ BT ${bt.bt}: ${oems.length} OEMs (total: ${totalOems})`);
+                    // Store results in database!
+                    const inserted = insertResults(jobId, rows);
+                    incrementJobParts(jobId, inserted);
+                    totalOems += inserted;
+                    logger.info(`    │ ✅ BT ${bt.bt}: ${inserted} OEMs stored (total: ${totalOems})`);
 
                     // Log first few OEMs for visibility
                     oems.slice(0, 3).forEach(o =>
@@ -601,7 +612,19 @@ export async function crawlSingleBrand(brand: string): Promise<{
             } else if (btLevel === 'parts') {
               // HG directly shows parts (no Bildtafeln)
               const oems = await extractOemsFromPage(page);
-              totalOems += oems.length;
+              if (oems.length > 0) {
+                const rows = oems.map(o => ({
+                  vin: vehicleVin,
+                  brand: brand.toUpperCase(), model,
+                  oem: o.oem, description: o.description,
+                  bildtafel: undefined,
+                  hg_code: hg.code, hg_name: hg.name,
+                  fg_code: undefined, fg_name: undefined,
+                }));
+                const inserted = insertResults(jobId, rows);
+                incrementJobParts(jobId, inserted);
+                totalOems += inserted;
+              }
               logger.info(`    │ ✅ Direct parts page: ${oems.length} OEMs`);
             } else {
               logger.warn(`    │ ⚠ Unexpected page level after HG click: ${btLevel}`);
@@ -635,6 +658,15 @@ export async function crawlSingleBrand(brand: string): Promise<{
     return { brand, modelsFound, totalOems, errors };
 
   } finally {
+    // Update job status
+    if (currentJobId) {
+      const finalStatus = bulkPaused ? 'paused' : (consecutiveErrors >= config.bulkMaxConsecutiveErrors ? 'failed' : 'completed');
+      updateJobStatus(currentJobId, finalStatus, {
+        total_parts_found: totalOems,
+        last_error: errors.length > 0 ? errors[errors.length - 1] : undefined,
+      });
+      logger.info(`📝 Job #${currentJobId} → ${finalStatus} (${totalOems} OEMs)`);
+    }
     try { await page.close(); } catch {}
     bulkRunning = false;
     currentBrand = null;
