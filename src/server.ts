@@ -19,7 +19,7 @@ import {
   createJob, getJob, getActiveJob, listJobs, updateJobStatus,
   getResults, getAllResultsForExport, getBulkStats, getJobProgress,
 } from './bulkStore';
-import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState, discoverBrandsAndModels } from './bulkCrawler';
+import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState, discoverBrandsAndModels, crawlSingleBrand } from './bulkCrawler';
 import { seedAllVins, getVinCount } from './vinSeeder';
 
 const app = express();
@@ -260,6 +260,28 @@ app.post('/api/bulk/discover', async (_req: Request, res: Response) => {
   }
 });
 
+// ── POST /api/bulk/crawl-brand — Crawl a single brand completely ─────────────
+
+app.post('/api/bulk/crawl-brand', async (req: Request, res: Response) => {
+  const { brand } = req.body;
+  if (!brand) return res.status(400).json({ error: 'brand required (e.g., "VW", "AUDI", "BMW")' });
+
+  logger.info(`🏭 Starting brand crawl: ${brand}`);
+  try {
+    // Return immediately with status, run crawl in background
+    res.json({ success: true, message: `Crawl started for ${brand}. Check logs for progress. Use GET /api/bulk/status for state.` });
+
+    // Run the crawl in background
+    crawlSingleBrand(brand).then(result => {
+      logger.info(`🏁 Brand crawl complete: ${brand}`, result);
+    }).catch(err => {
+      logger.error(`❌ Brand crawl failed: ${brand}`, { error: err.message });
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/bulk/vehicles/seed', (_req: Request, res: Response) => {
   try {
     const result = seedAllVins();
@@ -301,33 +323,31 @@ app.post('/api/bulk/jobs/start', async (req: Request, res: Response) => {
 });
 
 app.post('/api/bulk/jobs/start-all', async (_req: Request, res: Response) => {
+  // NEW: Sequential brand-by-brand approach
   const vehicles = listVehicles({ active: true });
   if (vehicles.length === 0) {
-    return res.status(400).json({ error: 'No active vehicles' });
+    return res.status(400).json({ error: 'No active vehicles. Run discovery first.' });
   }
 
-  const jobs: number[] = [];
-  for (const v of vehicles) {
-    try {
-      const job = createJob(v.id);
-      jobs.push(job.id);
-    } catch (err: any) {
-      logger.warn(`Failed to create job for vehicle ${v.id}`, { error: err.message });
+  // Get unique brands
+  const brands = [...new Set(vehicles.map(v => v.brand.toUpperCase()))];
+  logger.info(`🏭 Start-all: ${brands.length} brands to process sequentially: ${brands.join(', ')}`);
+
+  res.json({ success: true, message: `Processing ${brands.length} brands sequentially`, brands });
+
+  // Process brands one by one in background
+  (async () => {
+    for (const brand of brands) {
+      try {
+        logger.info(`\n🏭 ═══ STARTING BRAND: ${brand} ═══`);
+        const result = await crawlSingleBrand(brand);
+        logger.info(`✅ Brand ${brand} done: ${result.totalOems} OEMs, ${result.errors.length} errors`);
+      } catch (err: any) {
+        logger.error(`❌ Brand ${brand} failed: ${err.message}`);
+      }
     }
-  }
-
-  // Start first job, rest will be queued
-  if (jobs.length > 0) {
-    startCrawl(jobs[0]).catch(err => {
-      logger.error('First crawl failed', { error: err.message });
-    });
-    // Queue the rest
-    for (let i = 1; i < jobs.length; i++) {
-      updateJobStatus(jobs[i], 'queued');
-    }
-  }
-
-  res.json({ success: true, queued: jobs.length });
+    logger.info('🏁 All brands complete!');
+  })().catch(err => logger.error('Start-all failed', { error: err.message }));
 });
 
 app.post('/api/bulk/jobs/:id/pause', (req: Request, res: Response) => {
