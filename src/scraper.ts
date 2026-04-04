@@ -216,81 +216,64 @@ async function login(page: Page): Promise<boolean> {
 
     // Wait for the redirect chain to settle
     await waitForStable(page);
-    await humanDelay(1000, 2000);
+    await humanDelay(2000, 3000);
 
-    // ── Dismiss Usercentrics cookie consent overlay ──
-    // This MUST happen before any clicks, because it intercepts all pointer events
+    // ── Aggressively dismiss ALL overlays (cookie consent, modals, etc.) ──
+    // This MUST happen before any clicks, because overlays intercept pointer events.
     try {
-      // Try shadow DOM button first (Usercentrics v2 uses shadow DOM)
-      const ucRoot = page.locator('#usercentrics-root');
-      if (await ucRoot.count() > 0) {
-        logger.info('Cookie consent overlay detected — dismissing...');
-        
-        // Method 1: Try clicking common accept buttons
-        const acceptSelectors = [
-          'button[data-testid="uc-accept-all-button"]',
-          'button:has-text("Alle akzeptieren")',
-          'button:has-text("Accept All")',
-          'button:has-text("Akzeptieren")',
-          'button:has-text("Zustimmen")',
-          '#uc-btn-accept-banner',
-        ];
-        
-        let dismissed = false;
-        for (const sel of acceptSelectors) {
-          try {
-            const btn = page.locator(sel).first();
-            if (await btn.count() > 0 && await btn.isVisible({ timeout: 2000 })) {
-              await btn.click({ timeout: 3000 });
-              logger.info(`Cookie consent dismissed via: ${sel}`);
-              dismissed = true;
-              break;
+      await page.evaluate(`
+        (() => {
+          // Remove Usercentrics root
+          const uc = document.getElementById('usercentrics-root');
+          if (uc) uc.remove();
+          // Remove ALL fixed/absolute overlays that could block clicks
+          document.querySelectorAll('*').forEach(el => {
+            const style = window.getComputedStyle(el);
+            if ((style.position === 'fixed' || style.position === 'absolute') &&
+                style.zIndex && parseInt(style.zIndex) > 100 &&
+                el.tagName !== 'INPUT' && el.tagName !== 'FORM') {
+              el.remove();
             }
-          } catch { /* try next selector */ }
-        }
-        
-        // Method 2: Force-remove the overlay via JS
-        if (!dismissed) {
-          await page.evaluate(`
-            (() => {
-              const uc = document.getElementById('usercentrics-root');
-              if (uc) uc.remove();
-              document.querySelectorAll('[class*="overlay"], [class*="consent"], [class*="cookie"]').forEach(el => {
-                if (el.style && el.style.position === 'fixed') el.remove();
-              });
-            })()
-          `);
-          logger.info('Cookie consent force-removed via JS');
-        }
-        
-        await humanDelay(500, 1000);
-      }
+          });
+          // Remove common overlay classes
+          document.querySelectorAll(
+            '[class*="overlay"], [class*="consent"], [class*="cookie"], ' +
+            '[class*="modal"], [class*="backdrop"], [id*="consent"], [id*="cookie"]'
+          ).forEach(el => el.remove());
+        })()
+      `);
+      logger.info('Overlays force-removed via JS');
     } catch (err: any) {
-      logger.warn('Cookie consent dismissal failed — continuing anyway', { error: err.message });
+      logger.warn('Overlay removal failed — continuing', { error: err.message });
     }
+
+    // Wait for page to stabilize after overlay removal
+    await humanDelay(1000, 1500);
 
     // Check for bot detection before login
     await assertNotBlocked(page, 'pre-login');
 
-    // ── Find and fill the 3 login fields ──
-    // Real PL24 login form (verified March 2026):
-    //   Right panel with exactly 3 inputs:
-    //     1. "Firmenkennung / ID:" → text input
-    //     2. "Benutzername:"       → text input
-    //     3. "Passwort:"           → password input
-    //
-    // STRATEGY: Use positional approach — most reliable across environments.
-    // Find all visible text inputs + the password field, fill by position.
+    // Log current URL for debugging
+    logger.info(`Login page URL: ${page.url()}`);
 
-    // Wait for form to be ready
+    // ── Find and fill the 3 login fields ──
+    // Real PL24 login form:
+    //   1. "Firmenkennung / ID:" → text input
+    //   2. "Benutzername:"       → text input
+    //   3. "Passwort:"           → password input
+
+    // Wait for form to be ready — wait for password field
     const passField = page.locator('input[type="password"]:visible').first();
     try {
-      await passField.waitFor({ state: 'visible', timeout: 10000 });
+      await passField.waitFor({ state: 'visible', timeout: 15000 });
     } catch {
-      logger.error('Password field not visible within 10s — login form not loaded');
+      logger.error('Password field not visible within 15s — login form not loaded');
       await takeScreenshot(page, 'login-no-form');
       return false;
     }
+
+    // Extra wait for all form elements to be interactive
+    await humanDelay(500, 1000);
 
     // Get ALL visible text inputs on the page
     const textInputs = await page.locator('input[type="text"]:visible').all();
@@ -309,30 +292,36 @@ async function login(page: Page): Promise<boolean> {
       return false;
     }
 
-    // Fill Firmenkennung / ID (1st text input)
+    // Fill Firmenkennung / ID (1st text input) — triple-click to select all, then fill
     const companyField = textInputs[0];
-    await companyField.click();
+    await companyField.click({ clickCount: 3 });
     await humanDelay(100, 200);
-    await companyField.fill(config.pl24.companyId);
+    await companyField.fill('');
+    await humanDelay(50, 100);
+    await companyField.type(config.pl24.companyId, { delay: 30 });
     await humanDelay(200, 400);
     logger.info(`Filled Firmenkennung: "${config.pl24.companyId}"`);
 
     // Fill Benutzername (2nd text input)
     const userField = textInputs[1];
-    await userField.click();
+    await userField.click({ clickCount: 3 });
     await humanDelay(100, 200);
-    await userField.fill(config.pl24.username);
+    await userField.fill('');
+    await humanDelay(50, 100);
+    await userField.type(config.pl24.username, { delay: 30 });
     await humanDelay(200, 400);
     logger.info(`Filled Benutzername: "${config.pl24.username}"`);
 
     // Fill Passwort (password input)
-    await passField.click();
+    await passField.click({ clickCount: 3 });
     await humanDelay(100, 200);
-    await passField.fill(config.pl24.password);
-    await humanDelay(200, 400);
+    await passField.fill('');
+    await humanDelay(50, 100);
+    await passField.type(config.pl24.password, { delay: 30 });
+    await humanDelay(300, 500);
     logger.info('Filled Passwort: ****');
 
-    // Debug: take screenshot BEFORE clicking login to verify fields are filled
+    // Debug: take screenshot BEFORE submitting to verify fields are filled
     await takeScreenshot(page, 'login-before-submit');
 
     // Verify field values via JS (debug)
@@ -341,58 +330,102 @@ async function login(page: Page): Promise<boolean> {
         (() => {
           const texts = Array.from(document.querySelectorAll('input[type="text"]'))
             .filter(i => i.offsetParent !== null)
-            .map(i => i.value);
+            .map(i => ({ value: i.value, name: i.name || i.id || 'unnamed' }));
           const pass = document.querySelector('input[type="password"]')?.value?.length || 0;
-          return { textValues: texts, passLength: pass };
+          return { textFields: texts, passLength: pass };
         })()
       `);
-      logger.info(`Field verification — text values: ${JSON.stringify(fieldValues.textValues)}, password length: ${fieldValues.passLength}`);
+      logger.info(`Field verification: ${JSON.stringify(fieldValues)}`);
     } catch { /* ignore */ }
 
-    // Click "Login" button
-    let loginClicked = false;
-    const loginSelectors = [
-      'input[value="Login"]',                      // input submit button
-      'input[type="submit"][value="Login"]',
-      'button:has-text("Login")',                   // button element
-      'a:has-text("Login")',                        // link styled as button
-      'input[type="submit"]',                       // generic submit
-    ];
+    // ── Submit login form ──
+    // STRATEGY: Use Enter key FIRST (most reliable in real browser sessions),
+    // then fall back to clicking specific buttons.
+    // The old approach of clicking a:has-text("Login") was matching navigation links!
 
-    for (const sel of loginSelectors) {
+    logger.info('Submitting login via Enter key on password field...');
+    await passField.press('Enter');
+
+    // Wait for page navigation/change
+    await humanDelay(2000, 3000);
+
+    // Check if login succeeded via URL or DOM signals
+    const postLoginUrl = page.url();
+    logger.info(`Post-login URL: ${postLoginUrl}`);
+
+    // If URL still looks like login page, try clicking the actual submit button
+    if (postLoginUrl.includes('login') || postLoginUrl.includes('startup')) {
+      logger.info('Still on login page after Enter — trying button click...');
+
+      const loginSelectors = [
+        'input[value="Login"]',                      // input submit button (exact)
+        'input[value="LOGIN"]',                      // uppercase variant
+        'input[type="submit"][value="Login"]',
+        'input[type="submit"][value="LOGIN"]',
+        'input[type="submit"]',                       // generic submit
+        'button:has-text("Login")',                   // button element
+        'button[type="submit"]',                      // generic submit button
+      ];
+
+      for (const sel of loginSelectors) {
+        try {
+          const btn = page.locator(sel).first();
+          if (await btn.count() > 0 && await btn.isVisible({ timeout: 2000 })) {
+            logger.info(`Clicking Login via: ${sel}`);
+            await btn.click();
+            await humanDelay(2000, 3000);
+            break;
+          }
+        } catch { /* try next */ }
+      }
+
+      // Last resort: submit the form containing the password field via JS
       try {
-        const btn = page.locator(sel).first();
-        if (await btn.count() > 0 && await btn.isVisible({ timeout: 2000 })) {
-          logger.info(`Clicking Login via: ${sel}`);
-          await btn.click();
-          loginClicked = true;
-          break;
+        const formSubmitted = await page.evaluate(`
+          (() => {
+            const pass = document.querySelector('input[type="password"]');
+            const form = pass?.closest('form');
+            if (form) { form.submit(); return true; }
+            return false;
+          })()
+        `);
+        if (formSubmitted) {
+          logger.info('Login submitted via form.submit()');
+          await humanDelay(2000, 3000);
         }
-      } catch { /* try next */ }
+      } catch { /* ignore */ }
     }
 
-    if (!loginClicked) {
-      // Fallback: submit via Enter on password field
-      logger.info('No Login button found — pressing Enter');
-      await passField.press('Enter');
-    }
-
-     // Wait for redirect after login → should land on dashboard
-    // PL24 may keep the same URL (login.do) but load dashboard content.
-    // Wait for reliable dashboard indicator: "Abmelden" link in nav.
+    // ── Wait for dashboard to load ──
     logger.info('Waiting for dashboard to load...');
     let dashboardLoaded = false;
 
+    // Strategy 1: Wait for URL change to non-login URL
     try {
-      // Wait for "Abmelden" to appear — it ONLY exists on the dashboard, never on the login page
-      await page.locator('text=Abmelden').first().waitFor({ state: 'visible', timeout: 15000 });
+      await page.waitForURL(url => {
+        const u = url.toString().toLowerCase();
+        return !u.includes('login') && !u.includes('startup') &&
+               (u.includes('brandMenu') || u.includes('dashboard') ||
+                u.includes('pl24-app') || u.includes('partslink24.com/partslink24/'));
+      }, { timeout: 20000 });
+      logger.info(`Dashboard URL detected: ${page.url()}`);
       dashboardLoaded = true;
-      logger.info('Dashboard detected — "Abmelden" visible');
     } catch {
-      logger.warn('"Abmelden" not found within 15s — checking other signals');
+      logger.warn('URL did not change to dashboard within 20s');
     }
 
-    // Fallback: check for "Herzlich willkommen" (also unique to dashboard)
+    // Strategy 2: Wait for "Abmelden" text (most reliable DOM signal)
+    if (!dashboardLoaded) {
+      try {
+        await page.locator('text=Abmelden').first().waitFor({ state: 'visible', timeout: 10000 });
+        dashboardLoaded = true;
+        logger.info('Dashboard detected — "Abmelden" visible');
+      } catch {
+        logger.warn('"Abmelden" not found');
+      }
+    }
+
+    // Strategy 3: Wait for "Herzlich willkommen"
     if (!dashboardLoaded) {
       try {
         await page.locator('text=Herzlich willkommen').first().waitFor({ state: 'visible', timeout: 5000 });
@@ -403,13 +436,38 @@ async function login(page: Page): Promise<boolean> {
       }
     }
 
+    // Strategy 4: Check for VIN input field (only exists on dashboard)
+    if (!dashboardLoaded) {
+      try {
+        const vinField = page.locator('input[placeholder*="Fahrgestell" i], input[placeholder*="VIN" i]').first();
+        if (await vinField.count() > 0 && await vinField.isVisible({ timeout: 5000 })) {
+          dashboardLoaded = true;
+          logger.info('Dashboard detected — VIN input field visible');
+        }
+      } catch { /* not found */ }
+    }
+
+    // Strategy 5: Check for brand logos (dashboard has a brand grid)
+    if (!dashboardLoaded) {
+      try {
+        const brandLinks = await page.locator('a[href*="launchCatalog"]').count();
+        if (brandLinks > 0) {
+          dashboardLoaded = true;
+          logger.info(`Dashboard detected — ${brandLinks} brand launch links found`);
+        }
+      } catch { /* not found */ }
+    }
+
     // Check for bot detection post-login
     await assertNotBlocked(page, 'post-login');
 
     if (!dashboardLoaded) {
-      // Final verification attempt
+      // Final verification attempt via verifyLoginSuccess
       dashboardLoaded = await verifyLoginSuccess(page);
     }
+
+    // Log final state for debugging
+    logger.info(`Login result: dashboardLoaded=${dashboardLoaded}, URL=${page.url()}`);
 
     if (dashboardLoaded) {
       isLoggedIn = true;
@@ -420,6 +478,13 @@ async function login(page: Page): Promise<boolean> {
 
     logger.error('Login failed — dashboard did not load');
     await takeScreenshot(page, 'login-failed');
+
+    // Debug: dump page content for diagnosis
+    try {
+      const bodyText = await page.locator('body').innerText({ timeout: 5000 });
+      logger.info(`Login page body (first 300 chars): ${bodyText.substring(0, 300)}`);
+    } catch { /* ignore */ }
+
     return false;
 
   } catch (err: any) {
