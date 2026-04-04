@@ -189,26 +189,24 @@ export async function discoverBrandsAndModels(): Promise<{
         if (bulkPaused) break;
 
         try {
-          // Go back to dashboard
-          await page.goto('https://www.partslink24.com/partslink24/user/brandMenu.do', {
-            waitUntil: 'domcontentloaded', timeout: 30000
-          });
-          await waitForStable(page);
-          await humanDelay(1500, 2500);
-
-          // Click brand via launchCatalog link
-          const brandClicked = await selectBrand(page, brandKey);
-          if (!brandClicked) {
-            logger.warn(`[Discover] Brand "${brandKey}" not found`);
+          // Navigate DIRECTLY to the SPA URL for this brand
+          // Avoids session issues when going back to JSP dashboard
+          const serviceName = PL24_SERVICE_MAP[brandKey];
+          if (!serviceName) {
+            logger.warn(`[Discover] No service name for "${brandKey}"`);
             continue;
           }
 
-          // Wait for SPA to load
+          const spaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/0?desktop=true&lang=de`;
+          logger.info(`[Discover] Navigating to ${brandKey}: ${spaUrl}`);
+
+          await page.goto(spaUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           await humanDelay(3000, 5000);
           await assertNotBlocked(page, `discover-${brandKey}`);
 
           // Read model names from _value_ spans
           const values = await readValueSpans(page);
+          logger.info(`[Discover] ${brandKey}: ${values.length} value spans found`);
           const models = values.filter(v =>
             v.length > 3 && v.length < 50 &&
             !/^(Modell|Modelljahr|Einschränkung|Hauptgruppe|Startseite|Direkteinstieg)/.test(v) &&
@@ -415,26 +413,21 @@ async function discoverBildtafeln(job: BulkJob): Promise<Array<{
 // ── Navigate to HG Page ──────────────────────────────────────────────────────
 
 async function navigateToHgPage(page: Page, job: BulkJob): Promise<void> {
-  // Step 1: Login — same as solo lookup, ensureLoggedIn handles session reuse
+  // Step 1: Login
   const loggedIn = await ensureLoggedIn(page);
   if (!loggedIn) {
-    // Reset and retry once — same pattern as lookupOemInternal
     resetLoginState();
     await humanDelay(3000, 6000);
     const retryLogin = await ensureLoggedIn(page);
     if (!retryLogin) throw new Error('Login failed after retry');
   }
 
-  // Step 2: Go to dashboard
-  await page.goto('https://www.partslink24.com/partslink24/user/brandMenu.do', {
-    waitUntil: 'domcontentloaded', timeout: 30000,
-  });
-  await waitForStable(page);
-  await humanDelay(2000, 3000);
+  // Step 2: Navigate directly to brand SPA (skip dashboard to avoid session issues)
+  const serviceName = PL24_SERVICE_MAP[job.brand.toUpperCase()];
+  if (!serviceName) throw new Error(`No PL24 service name for brand "${job.brand}"`);
 
-  // Step 3: Click brand
-  const brandClicked = await selectBrand(page, job.brand);
-  if (!brandClicked) throw new Error(`Brand "${job.brand}" not found`);
+  const spaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/0?desktop=true&lang=de`;
+  await page.goto(spaUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await humanDelay(3000, 5000);
 
   // Step 4: Click model in SPA table

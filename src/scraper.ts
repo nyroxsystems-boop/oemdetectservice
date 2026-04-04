@@ -577,7 +577,6 @@ export { BRAND_MAP };
  */
 const PL24_SERVICE_MAP: Record<string, string> = {
   VW:          'vw_parts',
-  VOLKSWAGEN:  'vw_parts',
   AUDI:        'audi_parts',
   BMW:         'bmw_parts',
   MERCEDES:    'mercedes_parts',
