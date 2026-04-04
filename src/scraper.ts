@@ -130,6 +130,10 @@ export function getContext(): BrowserContext | null {
   return context;
 }
 
+export function resetLoginState(): void {
+  isLoggedIn = false;
+}
+
 // ============================================================================
 // BOT DETECTION — Check for CAPTCHAs, blocks, session timeouts
 // ============================================================================

@@ -21,6 +21,7 @@ import { enqueue } from './requestQueue';
 import {
   ensureLoggedIn, selectBrand, getContext, PL24_SERVICE_MAP,
   assertNotBlocked, sleep, humanDelay, waitForStable, takeScreenshot,
+  resetLoginState,
 } from './scraper';
 import {
   BulkJob, BulkProgressEntry,
@@ -139,21 +140,48 @@ export async function discoverBrandsAndModels(): Promise<{
     const ctx = getContext();
     if (!ctx) throw new Error('Browser not initialized');
 
-    const page = await ctx.newPage();
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
-
     const allModels: DiscoveredModel[] = [];
     const discoveredBrands: string[] = [];
     const errors: string[] = [];
 
-    try {
-      // Login once
-      const loggedIn = await ensureLoggedIn(page);
-      if (!loggedIn) throw new Error('Login failed');
+    // Login with retry — EXACT same pattern as lookupOemInternal in scraper.ts
+    let page: Page | null = null;
+    let retries = 0;
+    const MAX_RETRIES = 2;
 
-      logger.info('[Discover] Login OK, discovering brands...');
+    while (retries <= MAX_RETRIES) {
+      try {
+        page = await ctx.newPage();
+        await page.addInitScript(() => {
+          Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        });
+
+        // Step 1: Login — identical to solo OEM lookup
+        const loggedIn = await ensureLoggedIn(page);
+        if (!loggedIn) throw new Error('Login failed');
+
+        logger.info('[Discover] Login OK');
+        break; // Login succeeded, exit retry loop
+
+      } catch (err: any) {
+        retries++;
+        logger.warn(`[Discover] Login attempt ${retries}/${MAX_RETRIES + 1} failed: ${err.message}`);
+
+        if (page) { try { await page.close(); } catch { /* ignore */ } page = null; }
+
+        if (retries > MAX_RETRIES) {
+          throw new Error(`Login failed after ${MAX_RETRIES + 1} attempts`);
+        }
+
+        resetLoginState();
+        await humanDelay(3000, 6000);
+      }
+    }
+
+    if (!page) throw new Error('No page after login');
+
+    try {
+      logger.info('[Discover] Starting brand discovery...');
 
       const brandsToDiscover = Object.keys(PL24_SERVICE_MAP);
 
@@ -387,9 +415,15 @@ async function discoverBildtafeln(job: BulkJob): Promise<Array<{
 // ── Navigate to HG Page ──────────────────────────────────────────────────────
 
 async function navigateToHgPage(page: Page, job: BulkJob): Promise<void> {
-  // Step 1: Login
+  // Step 1: Login — same as solo lookup, ensureLoggedIn handles session reuse
   const loggedIn = await ensureLoggedIn(page);
-  if (!loggedIn) throw new Error('Login failed');
+  if (!loggedIn) {
+    // Reset and retry once — same pattern as lookupOemInternal
+    resetLoginState();
+    await humanDelay(3000, 6000);
+    const retryLogin = await ensureLoggedIn(page);
+    if (!retryLogin) throw new Error('Login failed after retry');
+  }
 
   // Step 2: Go to dashboard
   await page.goto('https://www.partslink24.com/partslink24/user/brandMenu.do', {
