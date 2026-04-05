@@ -281,13 +281,18 @@ export async function crawlBrandViaApi(brand: string): Promise<{
             // Process Bildtafeln — navigate SPA to HG page, then click each BT row
             // Build the SPA URL for this HG's subgroups page (authenticated, not demo)
             const hgPayload = JSON.stringify({ path: hg.link!.path, wid: 'subGroupsIllusTable', auto: true });
-            // Build HG SPA URL matching exactly what the browser produces
-            // Browser URL has: /0/{encodeURIComponent(btoa(json))}/
-            // But Playwright goto() does NOT re-encode, so we must provide the encoded form
-            const hgEncoded = Buffer.from(hgPayload).toString('base64');
-            // Replace / + = with URL-safe equivalents that the SPA router expects
-            const hgUrlSafe = hgEncoded.replace(/\//g, '%2F').replace(/\+/g, '%2B').replace(/=/g, '%3D');
-            const hgSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${hgUrlSafe}/`;
+            // Navigate to HG page by clicking in the SPA (URL manipulation doesn't work)
+            // We need to navigate: Brand SPA → click model → click year → click HG
+            // But that's too slow for every BT. Instead: navigate to HG page ONCE via
+            // the model list, then for each BT go back and click.
+
+            // Build the maingroups URL (this one works with goto — it's the HG list, not subgroups)
+            // We need to navigate to the HG page first, then click the HG to get to subgroups
+
+            // Strategy: For each BT, we go to the brand SPA, click through Model→Year→HG→BT
+            // But to avoid full re-navigation each time, we save the HG page URL after first click
+
+            let hgPageUrl: string | null = null;
 
             for (const bt of bildtafeln) {
               if (!bt.link?.path) continue;
@@ -299,23 +304,114 @@ export async function crawlBrandViaApi(brand: string): Promise<{
               const btSubgroup = bt.values?.subgroup || '';
 
               try {
-                // Step 1: Navigate to HG Bildtafel list page
                 logger.info(`      [${btIdx + 1}/${bildtafeln.length}] BT ${btIllus} "${btCaption}" (UG:${btSubgroup})`);
-                logger.info(`        → Step 1: goto HG page`);
 
-                await page.goto(hgSpaUrl, { waitUntil: 'networkidle', timeout: 20000 });
+                // Step 1: Navigate to HG subgroups page
+                if (!hgPageUrl) {
+                  // First time: click through the SPA to reach the HG subgroups page
+                  logger.info(`        → Step 1: navigating via SPA clicks (first time)`);
 
-                // Wait for SPA to fully render the Bildtafel list (need 20+ spans, not just sidebar)
-                let waitAttempts = 0;
-                let currentSpans = 0;
-                while (waitAttempts < 10) {
+                  // Go to brand SPA
+                  await page.goto(`https://www.partslink24.com/partslink24/launchCatalog.do?service=${serviceName}`, {
+                    waitUntil: 'domcontentloaded', timeout: 20000,
+                  });
+                  try { await page.waitForURL(/\/pl24-app\//, { timeout: 15000 }); } catch {}
+                  await page.waitForSelector('[class*="_value_"] span', { timeout: 8000 }).catch(() => {});
+                  await sleep(1000);
+
+                  // Click model
+                  await page.evaluate(`
+                    (() => {
+                      const spans = document.querySelectorAll('[class*="_value_"] span');
+                      for (const s of spans) {
+                        if (s.children.length === 0 && s.textContent?.trim() === ${JSON.stringify(modelName)}) {
+                          const row = s.closest('[class*="_row_"]') || s.parentElement?.parentElement;
+                          if (row) row.click(); else s.click();
+                          return true;
+                        }
+                      }
+                      return false;
+                    })()
+                  `);
+                  await sleep(1500);
+                  await page.waitForSelector('[class*="_value_"] span', { timeout: 5000 }).catch(() => {});
+
+                  // Click year (most recent)
+                  await page.evaluate(`
+                    (() => {
+                      const spans = document.querySelectorAll('[class*="_value_"] span');
+                      for (const s of spans) {
+                        if (s.children.length === 0 && /^\\d{4}$/.test(s.textContent?.trim())) {
+                          const row = s.closest('[class*="_row_"]') || s.parentElement?.parentElement;
+                          if (row) row.click(); else s.click();
+                          return true;
+                        }
+                      }
+                      return false;
+                    })()
+                  `);
+                  await sleep(1500);
+                  await page.waitForSelector('[class*="_value_"] span', { timeout: 5000 }).catch(() => {});
+
+                  // Check if we need to drill down (restrictions)
+                  const hasHg = await page.evaluate(`
+                    (() => {
+                      const spans = document.querySelectorAll('[class*="_value_"] span');
+                      for (const s of spans) {
+                        if (/^\\d\\s+/.test(s.textContent?.trim() || '')) return true;
+                      }
+                      return false;
+                    })()
+                  `) as any as boolean;
+
+                  if (!hasHg) {
+                    // Click first restriction option
+                    await page.evaluate(`
+                      (() => {
+                        const spans = document.querySelectorAll('[class*="_value_"] span');
+                        for (const s of spans) {
+                          const t = s.textContent?.trim() || '';
+                          if (t.length > 3 && !/^\\d{4}$/.test(t) && !/^(Modell|Einschränkung)/.test(t)) {
+                            s.click(); return true;
+                          }
+                        }
+                        return false;
+                      })()
+                    `);
+                    await sleep(1500);
+                    await page.waitForSelector('[class*="_value_"] span', { timeout: 5000 }).catch(() => {});
+                  }
+
+                  // Click the HG
+                  await page.evaluate(`
+                    (() => {
+                      const hgText = ${JSON.stringify(hgName)};
+                      const spans = document.querySelectorAll('[class*="_value_"] span');
+                      for (const s of spans) {
+                        if (s.children.length === 0 && s.textContent?.trim() === hgText) {
+                          s.click(); return true;
+                        }
+                      }
+                      return false;
+                    })()
+                  `);
+                  await sleep(2000);
+                  await page.waitForSelector('[class*="_value_"] span', { timeout: 8000 }).catch(() => {});
+
+                  hgPageUrl = page.url();
+                  const spanCount = await page.evaluate(`document.querySelectorAll('[class*="_value_"] span').length`) as any as number;
+                  logger.info(`        → Step 1 done: ${spanCount} spans, url=${hgPageUrl.substring(0, 60)}`);
+                } else {
+                  // Go back to saved HG page URL
+                  logger.info(`        → Step 1: goto saved HG page`);
+                  await page.goto(hgPageUrl, { waitUntil: 'networkidle', timeout: 20000 });
+                  await page.waitForSelector('[class*="_value_"] span', { timeout: 8000 }).catch(() => {});
                   await sleep(500);
-                  currentSpans = await page.evaluate(`document.querySelectorAll('[class*="_value_"] span').length`) as any as number;
-                  if (currentSpans > 15) break; // Sidebar has ~7, BT list has 50+
-                  waitAttempts++;
                 }
-                if (currentSpans <= 15 && btIdx === 0) {
-                  logger.warn(`        → Step 1: only ${currentSpans} spans after ${waitAttempts * 500}ms — BT list may not have loaded`);
+
+                const currentSpans = await page.evaluate(`document.querySelectorAll('[class*="_value_"] span').length`) as any as number;
+                if (currentSpans < 15 && btIdx === 0) {
+                  logger.warn(`        → Step 1: only ${currentSpans} spans — BT list not loaded`);
                 }
 
                 const postGotoUrl = page.url();
