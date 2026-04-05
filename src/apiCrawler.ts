@@ -79,16 +79,25 @@ interface PL24Response {
 /**
  * Call a PL24 API endpoint using the browser's session cookies.
  * This runs fetch() INSIDE the page context so cookies are sent automatically.
+ * Includes proper headers to pass CSRF/server-side checks.
  */
 async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
   const result = await page.evaluate(`
-    (function() {
-      return fetch(${JSON.stringify(apiPath)})
-        .then(function(r) {
-          if (!r.ok) return { error: r.status, data: { records: [] } };
-          return r.json();
-        })
-        .catch(function(e) { return { error: e.message, data: { records: [] } }; });
+    (async function() {
+      try {
+        const r = await fetch(${JSON.stringify(apiPath)}, {
+          credentials: 'same-origin',
+          headers: {
+            'Accept': 'application/json, text/plain, */*',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': window.location.href,
+          }
+        });
+        if (!r.ok) return { error: r.status, statusText: r.statusText, data: { records: [] } };
+        return await r.json();
+      } catch(e) {
+        return { error: e.message, data: { records: [] } };
+      }
     })()
   `) as any;
 
@@ -97,6 +106,50 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
   }
 
   return result as PL24Response;
+}
+
+/**
+ * Extract OEM numbers from the currently rendered DOM page.
+ * Used as fallback when direct API calls return 403.
+ */
+async function extractOemsFromDom(page: Page): Promise<Array<{ oem: string; description: string }>> {
+  return page.evaluate(`
+    (() => {
+      const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+      const values = [];
+      for (const s of spans) {
+        if (s.children.length === 0) {
+          const t = s.textContent?.trim();
+          if (t) values.push(t);
+        }
+      }
+      const oemPatterns = [
+        /^[A-Z0-9]{3}\\s\\d{3}\\s\\d{3}(\\s[A-Z0-9]{0,3})?$/,
+        /^\\d{2}\\s\\d{2}\\s\\d\\s\\d{3}\\s\\d{3}$/,
+        /^[A-Z]\\s?\\d{3}\\s?\\d{3}\\s?\\d{2}\\s?\\d{2}$/,
+        /^9[A-Z]\\d\\s?\\d{3}\\s?\\d{3}\\s?\\d{2}$/,
+        /^[A-Z0-9]{2,4}[\\s.-]\\d{3}[\\s.-]\\d{3}[\\s.-]?[A-Z0-9]{0,3}$/,
+      ];
+      const results = [];
+      const seen = new Set();
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i];
+        const isOem = oemPatterns.some(p => p.test(v));
+        const stripped = v.replace(/[\\s.-]/g, '');
+        const structuralOem = !isOem &&
+          stripped.length >= 7 && stripped.length <= 15 &&
+          /^[A-Z0-9]+$/.test(stripped) &&
+          /\\d/.test(stripped) && /[A-Z]/.test(stripped);
+        if ((isOem || structuralOem) && !seen.has(stripped)) {
+          seen.add(stripped);
+          const desc = (i + 1 < values.length && !oemPatterns.some(p => p.test(values[i + 1])))
+            ? values[i + 1] : '';
+          results.push({ oem: v, description: desc });
+        }
+      }
+      return results;
+    })()
+  `) as any as Array<{ oem: string; description: string }>;
 }
 
 // ── Main Entry Point ─────────────────────────────────────────────────────────
@@ -278,10 +331,22 @@ export async function crawlBrandViaApi(brand: string): Promise<{
               logger.info(`      ⚡ First BT link: ${firstBt.link?.path?.substring(0, 100)}`);
             }
 
-            // ── Process Bildtafeln via DIRECT API (no DOM clicking needed!) ──
-            // Each BT record's link.path points to /p5vwag/extern/bom/mdl?...
-            // which returns the parts list (OEM numbers) directly as JSON.
-            // This is 10x faster than navigating the SPA and eliminates click failures.
+            // ── Process Bildtafeln ──
+            // Strategy 1: Direct API call to BOM endpoint (fastest)
+            // Strategy 2: SPA URL navigation + DOM extraction (fallback for 403)
+            //
+            // The subgroups API returns BT records with link.path pointing to
+            // /p5vwag/extern/bom/mdl?... — we try fetching that directly first.
+            // If the BOM endpoint blocks us with 403, we construct the SPA URL
+            // and navigate the browser to it, letting the SPA handle auth.
+
+            let bomApiFailed = false; // Track if API approach works
+
+            // For SPA fallback: construct HG subgroups page URL for back-navigation
+            const hgPayload = Buffer.from(JSON.stringify({
+              path: hg.link!.path, wid: 'subGroupsIllusTable', auto: true
+            })).toString('base64');
+            const hgSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${encodeURIComponent(hgPayload)}/`;
 
             for (const bt of bildtafeln) {
               if (!bt.link?.path) continue;
@@ -295,30 +360,90 @@ export async function crawlBrandViaApi(brand: string): Promise<{
               try {
                 logger.info(`      [${btIdx + 1}/${bildtafeln.length}] BT ${btIllus} "${btCaption}" (UG:${btSubgroup})`);
 
-                // ⚡ Direct API call to BOM endpoint — no DOM navigation needed!
-                const bomResp = await pl24Fetch(page, bt.link.path);
-                const parts = bomResp.data?.records || [];
+                let oems: Array<{ oem: string; description: string }> = [];
 
-                // Extract OEM numbers from BOM response
-                // Each part record has values like: { partNo: "4K0 121 000", caption: "Kühlmittelpumpe" }
-                const oems: Array<{ oem: string; description: string }> = [];
-                const seen = new Set<string>();
+                // ── Strategy 1: Direct API call (fast, but may get 403) ──
+                if (!bomApiFailed) {
+                  try {
+                    const bomResp = await pl24Fetch(page, bt.link.path);
+                    const parts = bomResp.data?.records || [];
 
-                for (const part of parts) {
-                  const partNo = (part.values?.partNo || part.values?.['partNo'] || '').trim();
-                  const caption = (part.values?.caption || part.values?.['captions'] || part.values?.['name'] || '').trim();
+                    const seen = new Set<string>();
+                    for (const part of parts) {
+                      const partNo = (part.values?.partNo || part.values?.['partNo'] || '').trim();
+                      const caption = (part.values?.caption || part.values?.['captions'] || part.values?.['name'] || '').trim();
+                      if (!partNo) continue;
+                      const stripped = partNo.replace(/[\s.\-]/g, '');
+                      if (stripped.length < 5 || stripped.length > 20) continue;
+                      if (seen.has(stripped)) continue;
+                      seen.add(stripped);
+                      oems.push({ oem: partNo, description: caption });
+                    }
 
-                  if (!partNo) continue;
-
-                  // Validate: looks like an OEM number (has digits + letters, 7-15 chars stripped)
-                  const stripped = partNo.replace(/[\s.\-]/g, '');
-                  if (stripped.length < 5 || stripped.length > 20) continue;
-                  if (seen.has(stripped)) continue;
-                  seen.add(stripped);
-
-                  oems.push({ oem: partNo, description: caption });
+                    if (parts.length > 0 && oems.length === 0) {
+                      const firstPartKeys = Object.keys(parts[0].values || {});
+                      logger.info(`      ○ BT ${btIllus}: ${parts.length} records, 0 OEMs (keys: ${firstPartKeys.join(', ')})`);
+                    }
+                  } catch (apiErr: any) {
+                    if (apiErr.message?.includes('403')) {
+                      // BOM API returns 403 — switch to SPA navigation fallback
+                      if (!bomApiFailed) {
+                        logger.warn(`      ⚠ BOM API returns 403 — switching to SPA navigation mode`);
+                        bomApiFailed = true;
+                      }
+                    } else {
+                      throw apiErr; // Re-throw non-403 errors
+                    }
+                  }
                 }
 
+                // ── Strategy 2: SPA URL navigation + DOM extraction ──
+                if (bomApiFailed && oems.length === 0) {
+                  try {
+                    // Construct SPA URL for this specific BOM page
+                    const bomPayload = Buffer.from(JSON.stringify({
+                      path: bt.link!.path, wid: 'bomListTable', auto: true
+                    })).toString('base64');
+                    const bomSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${encodeURIComponent(bomPayload)}/`;
+
+                    await page.goto(bomSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                    // Wait for SPA to render value spans
+                    await page.waitForSelector('[class*="_value_"] span', { timeout: 8000 }).catch(() => {});
+                    await sleep(1500);
+
+                    // Check if page is in demo mode
+                    const currentUrl = page.url();
+                    if (currentUrl.includes('/demo')) {
+                      logger.warn(`      ⚠ SPA loaded in demo mode — session lost, attempting refresh`);
+                      // Try to refresh session via brand link
+                      await page.goto(`https://www.partslink24.com/partslink24/launchCatalog.do?service=${serviceName}`, {
+                        waitUntil: 'domcontentloaded', timeout: 15000,
+                      });
+                      try { await page.waitForURL(/\/pl24-app\//, { timeout: 10000 }); } catch {}
+                      await sleep(2000);
+                      // Retry the BOM URL
+                      await page.goto(bomSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                      await page.waitForSelector('[class*="_value_"] span', { timeout: 8000 }).catch(() => {});
+                      await sleep(1500);
+                    }
+
+                    // Extract OEMs from the rendered BOM page
+                    oems = await extractOemsFromDom(page);
+
+                    if (oems.length === 0) {
+                      // Dump page state for debugging (first few failures only)
+                      if (btIdx < 3) {
+                        const spanCount = await page.evaluate(`document.querySelectorAll('[class*="_value_"] span').length`) as any as number;
+                        const pageUrl = page.url();
+                        logger.info(`      ○ BT ${btIllus}: 0 OEMs from DOM (${spanCount} spans, url=${pageUrl.substring(0, 70)})`);
+                      }
+                    }
+                  } catch (spaErr: any) {
+                    logger.warn(`      ⚠ SPA fallback failed for BT ${btIllus}: ${spaErr.message?.substring(0, 80)}`);
+                  }
+                }
+
+                // ── Store results ──
                 if (oems.length > 0) {
                   const rows = oems.map(o => ({
                     vin: vehicleVin,
@@ -342,21 +467,13 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                   } else {
                     logger.info(`         ${oems[0].oem} — ${oems[0].description?.substring(0, 40)} ... +${oems.length - 1} more`);
                   }
-                } else {
-                  // Fallback: if no partNo fields, dump record keys for debugging
-                  if (parts.length > 0) {
-                    const firstPartKeys = Object.keys(parts[0].values || {});
-                    logger.info(`      ○ BT ${btIllus}: ${parts.length} records but 0 valid OEMs (keys: ${firstPartKeys.join(', ')})`);
-                  } else {
-                    logger.info(`      ○ BT ${btIllus}: 0 parts from API`);
-                  }
                 }
               } catch (err: any) {
                 logger.error(`      ❌ BT ${btIllus} error: ${err.message?.substring(0, 100)}`);
               }
 
-              // Small delay between API calls to avoid rate limiting
-              await sleep(200);
+              // Delay between requests — more for SPA mode (page navigation), less for API mode
+              await sleep(bomApiFailed ? 500 : 200);
             }
           } catch (err: any) {
             logger.warn(`    ⚡ HG "${hgName}" error: ${err.message}`);
