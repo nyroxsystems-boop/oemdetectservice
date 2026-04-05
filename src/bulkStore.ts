@@ -503,12 +503,21 @@ async function autoExportToOemDb(rows: Array<{
   }));
 
   try {
-    await fetch(`${wwsUrl}/api/admin/oem-database/bulk-import`, {
+    const resp = await fetch(`${wwsUrl}/api/admin/oem-database/bulk-import`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Token ${token}` },
       body: JSON.stringify({ records, source: 'partslink24-bulk-auto' }),
     });
-  } catch { /* silent */ }
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      logger.error(`[AutoExport] FAILED ${resp.status}: ${errText.substring(0, 200)}`);
+    } else {
+      const data = await resp.json().catch(() => ({})) as any;
+      logger.info(`[AutoExport] OK: ${data.imported || 0} imported, ${data.skipped || 0} skipped, total=${data.totalRecords || '?'}`);
+    }
+  } catch (err: any) {
+    logger.error(`[AutoExport] Error: ${err.message}`);
+  }
 }
 
 export function getResults(jobId: number, opts?: {
