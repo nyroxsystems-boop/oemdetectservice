@@ -224,25 +224,64 @@ export async function crawlBrandViaApi(brand: string): Promise<{
 
             logger.info(`    ⚡ HG "${hgName}": ${bildtafeln.length} Bildtafeln`);
 
-            // Process each Bildtafel — get BOM (parts)
+            // Process each Bildtafel — BOM endpoint needs SPA navigation (403 on direct fetch)
+            // So we navigate to the SPA URL and extract OEMs from DOM
             for (const bt of bildtafeln) {
               if (!bt.link?.path) continue;
 
               try {
-                const bomResp = await pl24Fetch(page, bt.link.path);
-                const parts = bomResp.data.records.filter(r => {
-                  const partNo = r.values?.partNo || r.values?.partNumber || '';
-                  return partNo.length >= 7;
-                });
+                // Build SPA URL from the API path
+                const bomPayload = JSON.stringify({ path: bt.link.path, wid: 'bomlist', auto: true });
+                const bomEncoded = Buffer.from(bomPayload).toString('base64');
+                const bomSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${encodeURIComponent(bomEncoded)}/`;
 
-                if (parts.length > 0) {
-                  const rows = parts.map(p => ({
+                await page.goto(bomSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                await sleep(1500);
+
+                // Extract OEMs from DOM using the proven _value_ span method
+                const oems = await page.evaluate(`
+                  (() => {
+                    const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+                    const values = [];
+                    for (const s of spans) {
+                      if (s.children.length === 0) {
+                        const t = s.textContent?.trim();
+                        if (t) values.push(t);
+                      }
+                    }
+                    const oemPatterns = [
+                      /^[A-Z0-9]{3}\\s\\d{3}\\s\\d{3}(\\s[A-Z0-9]{0,3})?$/,
+                      /^\\d{2}\\s\\d{2}\\s\\d\\s\\d{3}\\s\\d{3}$/,
+                      /^[A-Z]\\s?\\d{3}\\s?\\d{3}\\s?\\d{2}\\s?\\d{2}$/,
+                    ];
+                    const results = [];
+                    const seen = new Set();
+                    for (let i = 0; i < values.length; i++) {
+                      const v = values[i];
+                      const isOem = oemPatterns.some(p => p.test(v));
+                      const stripped = v.replace(/[\\s.-]/g, '');
+                      const structuralOem = !isOem && stripped.length >= 7 && stripped.length <= 15 &&
+                        /^[A-Z0-9]+$/.test(stripped) && /\\d/.test(stripped) && /[A-Z]/.test(stripped);
+                      if ((isOem || structuralOem) && !seen.has(stripped)) {
+                        seen.add(stripped);
+                        const desc = (i + 1 < values.length && !oemPatterns.some(p => p.test(values[i + 1])))
+                          ? values[i + 1] : '';
+                        results.push({ oem: v, description: desc });
+                      }
+                    }
+                    return results;
+                  })()
+                `) as any as Array<{ oem: string; description: string }>;
+
+                if (oems.length > 0) {
+                  const btNumber = bt.values?.illustrationNumber || '';
+                  const rows = oems.map(o => ({
                     vin: vehicleVin,
                     brand: brandUpper,
                     model: modelName,
-                    oem: p.values.partNo || p.values.partNumber || '',
-                    description: p.values.caption || p.values.description || '',
-                    bildtafel: bt.values?.illustrationNumber || '',
+                    oem: o.oem,
+                    description: o.description,
+                    bildtafel: btNumber,
                     hg_code: hgName.match(/^(\d)/)?.[1] || '',
                     hg_name: hgName,
                     fg_code: bt.values?.subgroup || '',
@@ -257,8 +296,8 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                 // Single BT failure — continue
               }
 
-              // Minimal delay to avoid rate limiting
-              await sleep(200);
+              // Small delay between BT pages
+              await sleep(300);
             }
           } catch (err: any) {
             logger.warn(`    ⚡ HG "${hgName}" error: ${err.message}`);
