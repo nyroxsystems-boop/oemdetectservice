@@ -117,39 +117,36 @@ function setupHeaderCapture(page: Page): void {
 
 /**
  * Call a PL24 API endpoint using the browser's session cookies.
- * Includes XSRF-TOKEN from cookies + any custom headers captured from the SPA.
+ * Injects the captured Bearer token from the SPA's own requests.
  */
 async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
+  // Pass the captured auth token from Node.js into the browser context
+  const capturedAuth = capturedSpaHeaders['authorization'] || '';
+  
   const result = await page.evaluate(`
     (async function() {
       try {
-        // Build headers: start with captured SPA headers, add our own
         const headers = {
           'Accept': 'application/json, text/plain, */*',
           'X-Requested-With': 'XMLHttpRequest',
           'Referer': window.location.href,
         };
         
-        // Extract XSRF-TOKEN from cookies (Spring Boot standard CSRF protection)
+        // Inject captured Bearer token from SPA (passed from Node.js)
+        const capturedAuth = ${JSON.stringify(capturedAuth)};
+        if (capturedAuth) {
+          headers['Authorization'] = capturedAuth;
+        }
+        
+        // Also try XSRF-TOKEN from cookies as backup
         const xsrf = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
         if (xsrf) headers['X-XSRF-TOKEN'] = decodeURIComponent(xsrf[1]);
-        
-        // Extract any csrf meta tags
-        const csrfMeta = document.querySelector('meta[name="csrf-token"], meta[name="_csrf"]');
-        if (csrfMeta) headers['X-CSRF-Token'] = csrfMeta.getAttribute('content');
-        
-        // Check for token in sessionStorage (some SPAs store auth tokens there)
-        try {
-          const storedToken = sessionStorage.getItem('token') || sessionStorage.getItem('accessToken');
-          if (storedToken) headers['Authorization'] = 'Bearer ' + storedToken;
-        } catch {}
         
         const r = await fetch(${JSON.stringify(apiPath)}, {
           credentials: 'same-origin',
           headers,
         });
         if (!r.ok) {
-          // On 403, dump debug info
           const respHeaders = {};
           r.headers.forEach((v, k) => { respHeaders[k] = v; });
           return {
@@ -159,7 +156,7 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
             debug: {
               cookies: document.cookie.substring(0, 200),
               url: window.location.href,
-              respHeaders,
+              hasAuth: !!capturedAuth,
             },
           };
         }
