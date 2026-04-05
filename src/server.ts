@@ -275,7 +275,7 @@ app.post('/api/bulk/crawl-brand', async (req: Request, res: Response) => {
   const { brand, mode } = req.body;
   if (!brand) return res.status(400).json({ error: 'brand required (e.g., "VW", "AUDI", "BMW")' });
 
-  const useApi = mode === 'api';
+  const useApi = mode !== 'browser'; // Default: API mode (faster)
   logger.info(`🏭 Starting brand crawl: ${brand} (mode: ${useApi ? 'API ⚡' : 'Browser 🌐'})`);
 
   try {
