@@ -296,14 +296,22 @@ export async function crawlBrandViaApi(brand: string): Promise<{
               try {
                 // Step 1: Navigate to HG Bildtafel list page
                 logger.info(`      [${btIdx + 1}/${bildtafeln.length}] BT ${btIllus} "${btCaption}" (UG:${btSubgroup})`);
-                logger.info(`        → Step 1: goto HG page: ${hgSpaUrl.substring(0, 80)}...`);
+                logger.info(`        → Step 1: goto HG page`);
 
                 await page.goto(hgSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                await sleep(1500);
+
+                // Wait for SPA React components to render (wait for _value_ spans to appear)
+                try {
+                  await page.waitForSelector('[class*="_value_"] span', { timeout: 8000 });
+                } catch {
+                  logger.warn(`        → Step 1: _value_ spans not found after 8s, trying anyway`);
+                }
+                await sleep(500);
 
                 const postGotoUrl = page.url();
                 const isDemo = postGotoUrl.includes('/demo');
-                logger.info(`        → Step 1 result: ${isDemo ? '⚠️ DEMO' : '✅ Auth'} url=${postGotoUrl.substring(0, 70)}`);
+                const spanCount = await page.evaluate(`document.querySelectorAll('[class*="_value_"] span').length`) as any as number;
+                logger.info(`        → Step 1 result: ${isDemo ? '⚠️ DEMO' : '✅ Auth'} ${spanCount} spans, url=${postGotoUrl.substring(0, 60)}`);
 
                 if (isDemo) {
                   logger.warn(`        → ⚠️ DEMO MODE detected! Skipping BT ${btIllus}. Session may be expired.`);
@@ -324,7 +332,8 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                       await sleep(2000);
                       logger.info(`        → 🔄 Session refresh done. Retrying HG page...`);
                       await page.goto(hgSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                      await sleep(1500);
+                      try { await page.waitForSelector('[class*="_value_"] span', { timeout: 8000 }); } catch {}
+                      await sleep(500);
                       const retryUrl = page.url();
                       logger.info(`        → 🔄 Retry result: ${retryUrl.includes('/demo') ? '⚠️ STILL DEMO' : '✅ Auth'}`);
                       if (retryUrl.includes('/demo')) {
@@ -412,7 +421,12 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                 }
 
                 logger.info(`        → Step 2 OK: clicked via ${clickMethod}`);
-                await sleep(1500);
+                // Wait for BOM page to render (new content after click)
+                await sleep(500);
+                try {
+                  await page.waitForSelector('[class*="_value_"] span', { timeout: 5000 });
+                } catch {}
+                await sleep(500);
 
                 // Verify we're on the BOM page (URL should have changed)
                 const postClickUrl = page.url();
