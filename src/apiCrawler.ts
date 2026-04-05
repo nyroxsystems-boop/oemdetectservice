@@ -281,8 +281,13 @@ export async function crawlBrandViaApi(brand: string): Promise<{
             // Process Bildtafeln — navigate SPA to HG page, then click each BT row
             // Build the SPA URL for this HG's subgroups page (authenticated, not demo)
             const hgPayload = JSON.stringify({ path: hg.link!.path, wid: 'subGroupsIllusTable', auto: true });
-            const hgEncoded = await page.evaluate(`encodeURIComponent(btoa(${JSON.stringify(hgPayload)}))`) as any as string;
-            const hgSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${hgEncoded}/`;
+            // Build HG SPA URL matching exactly what the browser produces
+            // Browser URL has: /0/{encodeURIComponent(btoa(json))}/
+            // But Playwright goto() does NOT re-encode, so we must provide the encoded form
+            const hgEncoded = Buffer.from(hgPayload).toString('base64');
+            // Replace / + = with URL-safe equivalents that the SPA router expects
+            const hgUrlSafe = hgEncoded.replace(/\//g, '%2F').replace(/\+/g, '%2B').replace(/=/g, '%3D');
+            const hgSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${hgUrlSafe}/`;
 
             for (const bt of bildtafeln) {
               if (!bt.link?.path) continue;
