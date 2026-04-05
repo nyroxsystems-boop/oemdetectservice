@@ -47,6 +47,18 @@ export function getApiState() {
   return { running: apiRunning, currentBrand: apiCurrentBrand };
 }
 
+export function cancelApi(): void {
+  apiRunning = false;
+  apiCurrentBrand = null;
+  apiAborted = true;
+}
+
+let apiAborted = false;
+
+export function isApiAborted(): boolean {
+  return apiAborted;
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface PL24Record {
@@ -114,6 +126,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
 
   apiRunning = true;
   apiCurrentBrand = brandUpper;
+  apiAborted = false;
 
   try {
     // Step 1: Login (reuses existing session if valid)
@@ -190,6 +203,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
 
     // Step 4: Process each model
     for (let mi = 0; mi < models.length; mi++) {
+      if (apiAborted) { logger.info('⚡ ABORTED by admin'); break; }
       const model = models[mi];
       const modelName = model.values.caption;
       if (!model.link?.path) continue;

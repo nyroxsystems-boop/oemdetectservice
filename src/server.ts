@@ -20,7 +20,7 @@ import {
   getResults, getAllResultsForExport, getBulkStats, getJobProgress,
 } from './bulkStore';
 import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState, discoverBrandsAndModels, crawlSingleBrand } from './bulkCrawler';
-import { crawlBrandViaApi, getApiState } from './apiCrawler';
+import { crawlBrandViaApi, getApiState, cancelApi } from './apiCrawler';
 import { PL24_SERVICE_MAP } from './scraper';
 import { seedAllVins, getVinCount } from './vinSeeder';
 
@@ -404,8 +404,28 @@ app.post('/api/bulk/jobs/:id/cancel', (req: Request, res: Response) => {
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
   cancelBulk();
+  cancelApi();
   updateJobStatus(id, 'failed', { last_error: 'Cancelled by admin' });
   res.json({ success: true });
+});
+
+// Cancel ALL crawling — both browser and API mode
+app.post('/api/bulk/cancel-all', (_req: Request, res: Response) => {
+  cancelBulk();
+  cancelApi();
+
+  // Cancel all running/queued jobs in DB
+  const { jobs } = listJobs({ limit: 100 });
+  let cancelled = 0;
+  for (const job of jobs) {
+    if (job.status === 'running' || job.status === 'queued' || job.status === 'paused') {
+      updateJobStatus(job.id, 'failed', { last_error: 'Cancelled by admin (cancel-all)' });
+      cancelled++;
+    }
+  }
+
+  logger.info(`Cancel-all: ${cancelled} jobs cancelled`);
+  res.json({ success: true, cancelled });
 });
 
 // ── Job Details ──────────────────────────────────────────────────────────────
