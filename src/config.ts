@@ -23,7 +23,7 @@ export const config = {
   cacheTtlSeconds: parseInt(process.env.CACHE_TTL_SECONDS || '2592000', 10), // 30 days
 
   // Bulk scraper — export target (WhatsApp-Bot API)
-  wwsBotUrl: process.env.WWS_BOT_URL || 'http://localhost:3000',
+  wwsBotUrl: process.env.WWS_BOT_URL || 'https://autoteile-bot-service-production.up.railway.app',
   adminToken: process.env.ADMIN_TOKEN || '',
 
   // Bulk scraper — crawl settings

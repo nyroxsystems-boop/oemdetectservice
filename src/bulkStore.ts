@@ -485,8 +485,10 @@ async function autoExportToOemDb(rows: Array<{
   const wwsUrl = config.wwsBotUrl;
   const token = config.adminToken;
 
-  if (!wwsUrl || wwsUrl === 'http://localhost:3000') return; // Not configured
-  if (!token) return;
+  if (!wwsUrl) {
+    logger.warn('[AutoExport] WWS_BOT_URL not configured — skipping');
+    return;
+  }
 
   const HG_CATEGORY_MAP: Record<string, string> = {
     '1': 'engine', '2': 'fuel', '3': 'transmission', '4': 'steering',
@@ -502,10 +504,15 @@ async function autoExportToOemDb(rows: Array<{
     part_category: HG_CATEGORY_MAP[r.hg_code || ''] || r.hg_name?.toLowerCase() || 'other',
   }));
 
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) {
+    headers['Authorization'] = `Token ${token}`;
+  }
+
   try {
-    const resp = await fetch(`${wwsUrl}/api/admin/oem-database/bulk-import`, {
+    const resp = await fetch(`${wwsUrl}/api/service/oem-bulk-import`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Token ${token}` },
+      headers,
       body: JSON.stringify({ records, source: 'partslink24-bulk-auto' }),
     });
     if (!resp.ok) {

@@ -495,12 +495,13 @@ app.post('/api/bulk/export', async (req: Request, res: Response) => {
     for (let i = 0; i < records.length; i += batchSize) {
       const batch = records.slice(i, i + batchSize);
       try {
-        const resp = await fetch(`${config.wwsBotUrl}/api/admin/oem-database/bulk-import`, {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (config.adminToken) {
+          headers['Authorization'] = `Token ${config.adminToken}`;
+        }
+        const resp = await fetch(`${config.wwsBotUrl}/api/service/oem-bulk-import`, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Token ${config.adminToken}`,
-          },
+          headers,
           body: JSON.stringify({ records: batch, source: 'partslink24-bulk' }),
         });
 
