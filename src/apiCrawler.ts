@@ -72,28 +72,97 @@ interface PL24Response {
   data: { records: PL24Record[] };
   crumbs?: Array<{ name: string }>;
   demo?: boolean;
+  error?: any;
+  debug?: any;
 }
 
 // ── API Helper ───────────────────────────────────────────────────────────────
 
 /**
+ * Headers captured from the SPA's own network requests.
+ * The SPA's JavaScript framework (Axios/Angular) adds custom headers
+ * like XSRF tokens that are required for BOM endpoints.
+ */
+let capturedSpaHeaders: Record<string, string> = {};
+
+/**
+ * Set up a network interceptor to capture headers from PL24's own API requests.
+ * Must be called BEFORE clicking the brand link so we catch the SPA's initial data load.
+ */
+function setupHeaderCapture(page: Page): void {
+  capturedSpaHeaders = {};
+  
+  page.on('request', (request) => {
+    // Only capture headers from PL24 API requests made by the SPA itself
+    const url = request.url();
+    if (url.includes('/p5vwag/extern/') && request.resourceType() === 'fetch') {
+      if (Object.keys(capturedSpaHeaders).length === 0) {
+        const headers = request.headers();
+        // Capture all non-standard headers (skip trivially common ones)
+        for (const [key, value] of Object.entries(headers)) {
+          capturedSpaHeaders[key.toLowerCase()] = value;
+        }
+        logger.info(`⚡ Captured ${Object.keys(capturedSpaHeaders).length} SPA headers`);
+        // Log interesting headers for debugging
+        const interesting = Object.entries(capturedSpaHeaders)
+          .filter(([k]) => k.startsWith('x-') || k === 'authorization' || k.includes('csrf') || k.includes('token'))
+          .map(([k, v]) => `${k}: ${v.substring(0, 30)}`);
+        if (interesting.length > 0) {
+          logger.info(`⚡ Custom headers: ${interesting.join(', ')}`);
+        }
+      }
+    }
+  });
+}
+
+/**
  * Call a PL24 API endpoint using the browser's session cookies.
- * This runs fetch() INSIDE the page context so cookies are sent automatically.
- * Includes proper headers to pass CSRF/server-side checks.
+ * Includes XSRF-TOKEN from cookies + any custom headers captured from the SPA.
  */
 async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
   const result = await page.evaluate(`
     (async function() {
       try {
+        // Build headers: start with captured SPA headers, add our own
+        const headers = {
+          'Accept': 'application/json, text/plain, */*',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Referer': window.location.href,
+        };
+        
+        // Extract XSRF-TOKEN from cookies (Spring Boot standard CSRF protection)
+        const xsrf = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+        if (xsrf) headers['X-XSRF-TOKEN'] = decodeURIComponent(xsrf[1]);
+        
+        // Extract any csrf meta tags
+        const csrfMeta = document.querySelector('meta[name="csrf-token"], meta[name="_csrf"]');
+        if (csrfMeta) headers['X-CSRF-Token'] = csrfMeta.getAttribute('content');
+        
+        // Check for token in sessionStorage (some SPAs store auth tokens there)
+        try {
+          const storedToken = sessionStorage.getItem('token') || sessionStorage.getItem('accessToken');
+          if (storedToken) headers['Authorization'] = 'Bearer ' + storedToken;
+        } catch {}
+        
         const r = await fetch(${JSON.stringify(apiPath)}, {
           credentials: 'same-origin',
-          headers: {
-            'Accept': 'application/json, text/plain, */*',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': window.location.href,
-          }
+          headers,
         });
-        if (!r.ok) return { error: r.status, statusText: r.statusText, data: { records: [] } };
+        if (!r.ok) {
+          // On 403, dump debug info
+          const respHeaders = {};
+          r.headers.forEach((v, k) => { respHeaders[k] = v; });
+          return {
+            error: r.status,
+            statusText: r.statusText,
+            data: { records: [] },
+            debug: {
+              cookies: document.cookie.substring(0, 200),
+              url: window.location.href,
+              respHeaders,
+            },
+          };
+        }
         return await r.json();
       } catch(e) {
         return { error: e.message, data: { records: [] } };
@@ -102,10 +171,52 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
   `) as any;
 
   if (result.error) {
+    // Log debug info for 403 errors
+    if (result.debug) {
+      logger.warn(`PL24 API ${result.error} debug:`, {
+        cookies: result.debug.cookies?.substring(0, 100),
+        pageUrl: result.debug.url?.substring(0, 60),
+      });
+    }
     throw new Error(`PL24 API ${result.error}: ${apiPath.substring(0, 80)}`);
   }
 
   return result as PL24Response;
+}
+
+/**
+ * Try to fetch BOM data using Playwright's API request context.
+ * This sends the request from Node.js with the browser's cookies attached.
+ * Different from page.evaluate(fetch) — bypasses Service Workers and JS interceptors.
+ */
+async function pl24FetchViaPlaywright(page: Page, apiPath: string): Promise<PL24Response> {
+  const fullUrl = apiPath.startsWith('http')
+    ? apiPath
+    : `https://www.partslink24.com${apiPath}`;
+  
+  try {
+    const response = await page.request.get(fullUrl, {
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': page.url(),
+        // Include any captured SPA headers
+        ...Object.fromEntries(
+          Object.entries(capturedSpaHeaders).filter(([k]) =>
+            k.startsWith('x-') || k === 'authorization' || k.includes('csrf') || k.includes('token')
+          )
+        ),
+      },
+    });
+
+    if (!response.ok()) {
+      throw new Error(`PL24 API ${response.status()}: ${apiPath.substring(0, 80)}`);
+    }
+
+    return await response.json() as PL24Response;
+  } catch (err: any) {
+    throw new Error(`PL24 Playwright API: ${err.message?.substring(0, 100)}`);
+  }
 }
 
 /**
@@ -195,6 +306,9 @@ export async function crawlBrandViaApi(brand: string): Promise<{
     // Step 2: Navigate to brand SPA via the dashboard link (transfers JSP session → SPA)
     // We need to click the actual launchCatalog link from the dashboard to get the session token
     logger.info('⚡ Clicking brand link on dashboard to transfer session to SPA...');
+
+    // Set up header capture BEFORE clicking — catches the SPA's initial API call headers
+    setupHeaderCapture(page);
 
     // Find and click the brand link on the dashboard page
     const brandLinkClicked = await page.evaluate(`
@@ -362,7 +476,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
 
                 let oems: Array<{ oem: string; description: string }> = [];
 
-                // ── Strategy 1: Direct API call (fast, but may get 403) ──
+                // ── Strategy 1: Direct API call via page.evaluate(fetch) ──
                 if (!bomApiFailed) {
                   try {
                     const bomResp = await pl24Fetch(page, bt.link.path);
@@ -386,10 +500,36 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                     }
                   } catch (apiErr: any) {
                     if (apiErr.message?.includes('403')) {
-                      // BOM API returns 403 — switch to SPA navigation fallback
                       if (!bomApiFailed) {
-                        logger.warn(`      ⚠ BOM API returns 403 — switching to SPA navigation mode`);
-                        bomApiFailed = true;
+                        logger.warn(`      ⚠ BOM API (fetch) returns 403 — trying Playwright API...`);
+                      }
+                      
+                      // ── Strategy 1.5: Playwright-level request (Node.js, different networking path) ──
+                      try {
+                        const bomResp = await pl24FetchViaPlaywright(page, bt.link!.path);
+                        const parts = bomResp.data?.records || [];
+
+                        const seen = new Set<string>();
+                        for (const part of parts) {
+                          const partNo = (part.values?.partNo || part.values?.['partNo'] || '').trim();
+                          const caption = (part.values?.caption || part.values?.['captions'] || part.values?.['name'] || '').trim();
+                          if (!partNo) continue;
+                          const stripped = partNo.replace(/[\s.\-]/g, '');
+                          if (stripped.length < 5 || stripped.length > 20) continue;
+                          if (seen.has(stripped)) continue;
+                          seen.add(stripped);
+                          oems.push({ oem: partNo, description: caption });
+                        }
+
+                        if (oems.length > 0) {
+                          logger.info(`      ⚡ Playwright API worked! ${oems.length} OEMs`);
+                        }
+                      } catch (pwErr: any) {
+                        if (!bomApiFailed) {
+                          logger.warn(`      ⚠ Playwright API also failed: ${pwErr.message?.substring(0, 60)}`);
+                          logger.warn(`      ⚠ Switching to SPA navigation mode`);
+                          bomApiFailed = true;
+                        }
                       }
                     } else {
                       throw apiErr; // Re-throw non-403 errors
@@ -397,8 +537,11 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                   }
                 }
 
-                // ── Strategy 2: SPA URL navigation + DOM extraction ──
+                // ── Strategy 2: SPA navigation in NEW TAB + DOM extraction ──
+                // IMPORTANT: Use a new tab to avoid destroying the main page's SPA session.
+                // page.goto() on the main page kills the SPA's in-memory auth state → demo mode.
                 if (bomApiFailed && oems.length === 0) {
+                  let bomTab: Page | null = null;
                   try {
                     // Construct SPA URL for this specific BOM page
                     const bomPayload = Buffer.from(JSON.stringify({
@@ -406,40 +549,33 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                     })).toString('base64');
                     const bomSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${encodeURIComponent(bomPayload)}/`;
 
-                    await page.goto(bomSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                    // Open in a new tab (shares cookies with the main page's browser context)
+                    bomTab = await page.context().newPage();
+                    await bomTab.goto(bomSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
                     // Wait for SPA to render value spans
-                    await page.waitForSelector('[class*="_value_"] span', { timeout: 8000 }).catch(() => {});
+                    await bomTab.waitForSelector('[class*="_value_"] span', { timeout: 8000 }).catch(() => {});
                     await sleep(1500);
 
                     // Check if page is in demo mode
-                    const currentUrl = page.url();
+                    const currentUrl = bomTab.url();
                     if (currentUrl.includes('/demo')) {
-                      logger.warn(`      ⚠ SPA loaded in demo mode — session lost, attempting refresh`);
-                      // Try to refresh session via brand link
-                      await page.goto(`https://www.partslink24.com/partslink24/launchCatalog.do?service=${serviceName}`, {
-                        waitUntil: 'domcontentloaded', timeout: 15000,
-                      });
-                      try { await page.waitForURL(/\/pl24-app\//, { timeout: 10000 }); } catch {}
-                      await sleep(2000);
-                      // Retry the BOM URL
-                      await page.goto(bomSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                      await page.waitForSelector('[class*="_value_"] span', { timeout: 8000 }).catch(() => {});
-                      await sleep(1500);
+                      if (btIdx < 3) {
+                        logger.warn(`      ⚠ New tab loaded in demo mode — session cookies insufficient`);
+                      }
+                    } else {
+                      // Extract OEMs from the rendered BOM page
+                      oems = await extractOemsFromDom(bomTab);
                     }
 
-                    // Extract OEMs from the rendered BOM page
-                    oems = await extractOemsFromDom(page);
-
-                    if (oems.length === 0) {
-                      // Dump page state for debugging (first few failures only)
-                      if (btIdx < 3) {
-                        const spanCount = await page.evaluate(`document.querySelectorAll('[class*="_value_"] span').length`) as any as number;
-                        const pageUrl = page.url();
-                        logger.info(`      ○ BT ${btIllus}: 0 OEMs from DOM (${spanCount} spans, url=${pageUrl.substring(0, 70)})`);
-                      }
+                    if (oems.length === 0 && btIdx < 3) {
+                      const spanCount = await bomTab.evaluate(`document.querySelectorAll('[class*="_value_"] span').length`) as any as number;
+                      logger.info(`      ○ BT ${btIllus}: 0 OEMs from DOM (${spanCount} spans, url=${currentUrl.substring(0, 70)})`);
                     }
                   } catch (spaErr: any) {
                     logger.warn(`      ⚠ SPA fallback failed for BT ${btIllus}: ${spaErr.message?.substring(0, 80)}`);
+                  } finally {
+                    // Always close the tab to avoid resource leaks
+                    if (bomTab) await bomTab.close().catch(() => {});
                   }
                 }
 
