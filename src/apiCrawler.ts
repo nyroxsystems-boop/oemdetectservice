@@ -276,40 +276,77 @@ export async function crawlBrandViaApi(brand: string): Promise<{
               logger.info(`      ⚡ First BT link: ${firstBt.link?.path?.substring(0, 100)}`);
             }
 
-            // Process each Bildtafel — BOM endpoint needs SPA navigation (403 on direct fetch)
-            // So we navigate to the SPA URL and extract OEMs from DOM
+            // Process Bildtafeln — navigate SPA to HG page, then click each BT row
+            // Build the SPA URL for this HG's subgroups page (authenticated, not demo)
+            const hgPayload = JSON.stringify({ path: hg.link!.path, wid: 'subGroupsIllusTable', auto: true });
+            const hgEncoded = await page.evaluate(`btoa(${JSON.stringify(hgPayload)})`) as any as string;
+            const hgSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${hgEncoded}/`;
+
             for (const bt of bildtafeln) {
               if (!bt.link?.path) continue;
+              if (apiAborted) break;
 
               try {
-                // Navigate within the SPA using the React router
-                // Build the base64-encoded path and use window.location.hash or pushState
-                const bomPayload = JSON.stringify({ path: bt.link.path, wid: 'bomlist', auto: true });
+                // Step 1: Navigate to HG Bildtafel list page (go back each time for clean state)
+                await page.goto(hgSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                await sleep(1500);
 
-                // Use the SPA's internal navigation by changing the URL hash/path
-                const bomEncoded = await page.evaluate(`btoa(${JSON.stringify(bomPayload)})`) as any as string;
-                const bomSpaPath = `/pl24-app/${serviceName}/0/${bomEncoded}/`;
+                // Step 2: Click the Bildtafel row by its illustration number or caption
+                const btIllus = bt.values?.illustrationNumber || '';
+                const btCaption = bt.values?.captions || '';
+                const btSubgroup = bt.values?.subgroup || '';
 
-                await page.evaluate(`window.history.pushState({}, '', ${JSON.stringify(bomSpaPath)}); window.dispatchEvent(new PopStateEvent('popstate'));`);
-                await sleep(2000);
-
-                // If pushState didn't trigger the SPA router, try direct navigation
-                const currentUrl = page.url();
-                if (!currentUrl.includes(bomEncoded.substring(0, 20))) {
-                  await page.goto(`https://www.partslink24.com${bomSpaPath}`, {
-                    waitUntil: 'domcontentloaded', timeout: 15000,
-                  });
-                  await sleep(2000);
+                // Try clicking by caption (most unique), then illustration number parts
+                let clicked = false;
+                if (btCaption) {
+                  clicked = await page.evaluate(`
+                    (() => {
+                      const searchText = ${JSON.stringify(btCaption.split('\n')[0].trim())};
+                      const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+                      for (const s of spans) {
+                        if (s.children.length === 0 && s.textContent?.trim() === searchText) {
+                          const row = s.closest('[class*="_row_"], [class*="_line_"], [class*="Row"], tr') || s.parentElement?.parentElement;
+                          if (row) { row.click(); return true; }
+                          s.click(); return true;
+                        }
+                      }
+                      return false;
+                    })()
+                  `) as any as boolean;
                 }
+
+                if (!clicked && btIllus) {
+                  // Try clicking by illustration number parts (e.g., "100" from "100-010")
+                  const illusParts = btIllus.replace(/\\/g, '').split('-');
+                  if (illusParts.length >= 2) {
+                    clicked = await page.evaluate(`
+                      (() => {
+                        const part2 = ${JSON.stringify(illusParts[1])};
+                        const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+                        for (const s of spans) {
+                          if (s.children.length === 0 && s.textContent?.trim() === part2) {
+                            const row = s.closest('[class*="_row_"], [class*="_line_"], [class*="Row"], tr') || s.parentElement?.parentElement;
+                            if (row) { row.click(); return true; }
+                            s.click(); return true;
+                          }
+                        }
+                        return false;
+                      })()
+                    `) as any as boolean;
+                  }
+                }
+
+                if (!clicked) continue;
+                await sleep(1500);
 
                 // Debug: log for first BT of each HG
                 if (bt === bildtafeln[0]) {
                   const curUrl = page.url();
                   const isDemo = curUrl.includes('/demo');
-                  logger.info(`      ⚡ First BT: url=${curUrl.substring(0, 60)}... ${isDemo ? '⚠️ DEMO' : '✅ Auth'}`);
+                  logger.info(`      ⚡ First BT click: ${isDemo ? '⚠️ DEMO' : '✅ Auth'} url=${curUrl.substring(0, 60)}`);
                 }
 
-                // Extract OEMs from DOM using the proven _value_ span method
+                // Step 3: Extract OEMs from DOM using the proven _value_ span method
                 const oems = await page.evaluate(`
                   (() => {
                     const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
