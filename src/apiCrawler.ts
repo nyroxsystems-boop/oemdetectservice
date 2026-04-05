@@ -126,21 +126,42 @@ export async function crawlBrandViaApi(brand: string): Promise<{
     }
     logger.info('⚡ Login OK');
 
-    // Step 2: Navigate to brand SPA via launchCatalog.do (transfers session to SPA)
-    // Direct navigation to /pl24-app/ doesn't transfer the JSP session → SPA loads in demo mode
-    // The launchCatalog.do link on the dashboard properly bridges the JSP→SPA session
-    logger.info('⚡ Navigating to brand via launchCatalog.do...');
-    await page.goto(`https://www.partslink24.com/partslink24/launchCatalog.do?service=${serviceName}`, {
-      waitUntil: 'domcontentloaded', timeout: 30000,
-    });
-    // Wait for SPA redirect to complete
-    try {
-      await page.waitForURL(/\/pl24-app\//, { timeout: 15000 });
-    } catch {
-      logger.warn('⚡ SPA redirect not detected, continuing anyway');
+    // Step 2: Navigate to brand SPA via the dashboard link (transfers JSP session → SPA)
+    // We need to click the actual launchCatalog link from the dashboard to get the session token
+    logger.info('⚡ Clicking brand link on dashboard to transfer session to SPA...');
+
+    // Find and click the brand link on the dashboard page
+    const brandLinkClicked = await page.evaluate(`
+      (() => {
+        const links = document.querySelectorAll('a[href*="launchCatalog"][href*="${serviceName}"]');
+        if (links.length > 0) { links[0].click(); return true; }
+        return false;
+      })()
+    `) as any as boolean;
+
+    if (!brandLinkClicked) {
+      // Fallback: navigate directly
+      logger.warn('⚡ Brand link not found on dashboard, trying direct navigation');
+      await page.goto(`https://www.partslink24.com/partslink24/launchCatalog.do?service=${serviceName}`, {
+        waitUntil: 'domcontentloaded', timeout: 30000,
+      });
     }
-    await sleep(2000);
-    logger.info(`⚡ SPA URL: ${page.url().substring(0, 80)}`);
+
+    // Wait for SPA to load
+    try {
+      await page.waitForURL(/\/pl24-app\//, { timeout: 20000 });
+    } catch {
+      logger.warn('⚡ SPA URL not detected after brand click');
+    }
+    await sleep(3000);
+
+    const spaUrl = page.url();
+    const isDemo = spaUrl.includes('/demo');
+    logger.info(`⚡ SPA URL: ${spaUrl.substring(0, 80)}${isDemo ? ' ⚠️ DEMO MODE!' : ' ✅ Authenticated'}`);
+
+    if (isDemo) {
+      throw new Error('SPA loaded in demo mode — session transfer failed');
+    }
 
     // Step 3: Fetch model list via API
     const upds = '2026-03-27--00-02'; // PL24 update timestamp
@@ -247,19 +268,31 @@ export async function crawlBrandViaApi(brand: string): Promise<{
               if (!bt.link?.path) continue;
 
               try {
-                // Build SPA URL from the API path
+                // Navigate within the SPA using the React router
+                // Build the base64-encoded path and use window.location.hash or pushState
                 const bomPayload = JSON.stringify({ path: bt.link.path, wid: 'bomlist', auto: true });
-                const bomEncoded = Buffer.from(bomPayload).toString('base64');
-                const bomSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${encodeURIComponent(bomEncoded)}/`;
 
-                await page.goto(bomSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                await sleep(2000); // Wait for SPA React components to render
+                // Use the SPA's internal navigation by changing the URL hash/path
+                const bomEncoded = await page.evaluate(`btoa(${JSON.stringify(bomPayload)})`) as any as string;
+                const bomSpaPath = `/pl24-app/${serviceName}/0/${bomEncoded}/`;
 
-                // Debug: log current URL and page title for first BT of each HG
+                await page.evaluate(`window.history.pushState({}, '', ${JSON.stringify(bomSpaPath)}); window.dispatchEvent(new PopStateEvent('popstate'));`);
+                await sleep(2000);
+
+                // If pushState didn't trigger the SPA router, try direct navigation
+                const currentUrl = page.url();
+                if (!currentUrl.includes(bomEncoded.substring(0, 20))) {
+                  await page.goto(`https://www.partslink24.com${bomSpaPath}`, {
+                    waitUntil: 'domcontentloaded', timeout: 15000,
+                  });
+                  await sleep(2000);
+                }
+
+                // Debug: log for first BT of each HG
                 if (bt === bildtafeln[0]) {
                   const curUrl = page.url();
-                  const title = await page.title();
-                  logger.info(`      ⚡ DEBUG first BT page: title="${title}", url=${curUrl.substring(0, 80)}...`);
+                  const isDemo = curUrl.includes('/demo');
+                  logger.info(`      ⚡ First BT: url=${curUrl.substring(0, 60)}... ${isDemo ? '⚠️ DEMO' : '✅ Auth'}`);
                 }
 
                 // Extract OEMs from DOM using the proven _value_ span method
