@@ -126,11 +126,21 @@ export async function crawlBrandViaApi(brand: string): Promise<{
     }
     logger.info('⚡ Login OK');
 
-    // Step 2: Navigate to brand SPA (needed for cookie context)
-    await page.goto(`https://www.partslink24.com/pl24-app/${serviceName}/0/0?desktop=true&lang=de`, {
+    // Step 2: Navigate to brand SPA via launchCatalog.do (transfers session to SPA)
+    // Direct navigation to /pl24-app/ doesn't transfer the JSP session → SPA loads in demo mode
+    // The launchCatalog.do link on the dashboard properly bridges the JSP→SPA session
+    logger.info('⚡ Navigating to brand via launchCatalog.do...');
+    await page.goto(`https://www.partslink24.com/partslink24/launchCatalog.do?service=${serviceName}`, {
       waitUntil: 'domcontentloaded', timeout: 30000,
     });
+    // Wait for SPA redirect to complete
+    try {
+      await page.waitForURL(/\/pl24-app\//, { timeout: 15000 });
+    } catch {
+      logger.warn('⚡ SPA redirect not detected, continuing anyway');
+    }
     await sleep(2000);
+    logger.info(`⚡ SPA URL: ${page.url().substring(0, 80)}`);
 
     // Step 3: Fetch model list via API
     const upds = '2026-03-27--00-02'; // PL24 update timestamp
