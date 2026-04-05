@@ -437,7 +437,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                       try { await page.waitForURL(/\/pl24-app\//, { timeout: 10000 }); } catch {}
                       await sleep(2000);
                       logger.info(`        → 🔄 Session refresh done. Retrying HG page...`);
-                      await page.goto(hgSpaUrl, { waitUntil: 'networkidle', timeout: 20000 });
+                      if (hgPageUrl) await page.goto(hgPageUrl, { waitUntil: 'networkidle', timeout: 20000 });
                       let retrySpans = 0;
                       for (let w = 0; w < 10; w++) {
                         await sleep(500);
