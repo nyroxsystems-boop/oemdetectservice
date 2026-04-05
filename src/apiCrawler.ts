@@ -281,7 +281,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
             // Process Bildtafeln — navigate SPA to HG page, then click each BT row
             // Build the SPA URL for this HG's subgroups page (authenticated, not demo)
             const hgPayload = JSON.stringify({ path: hg.link!.path, wid: 'subGroupsIllusTable', auto: true });
-            const hgEncoded = await page.evaluate(`btoa(${JSON.stringify(hgPayload)})`) as any as string;
+            const hgEncoded = await page.evaluate(`encodeURIComponent(btoa(${JSON.stringify(hgPayload)}))`) as any as string;
             const hgSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${hgEncoded}/`;
 
             for (const bt of bildtafeln) {
