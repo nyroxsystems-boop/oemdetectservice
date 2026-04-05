@@ -224,6 +224,13 @@ export async function crawlBrandViaApi(brand: string): Promise<{
 
             logger.info(`    ⚡ HG "${hgName}": ${bildtafeln.length} Bildtafeln`);
 
+            // Log first BT for debugging
+            if (bildtafeln.length > 0) {
+              const firstBt = bildtafeln[0];
+              logger.info(`      ⚡ First BT: illustration=${firstBt.values?.illustrationNumber}, subgroup=${firstBt.values?.subgroup}, caption=${firstBt.values?.captions?.substring(0, 40)}`);
+              logger.info(`      ⚡ First BT link: ${firstBt.link?.path?.substring(0, 100)}`);
+            }
+
             // Process each Bildtafel — BOM endpoint needs SPA navigation (403 on direct fetch)
             // So we navigate to the SPA URL and extract OEMs from DOM
             for (const bt of bildtafeln) {
@@ -236,7 +243,14 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                 const bomSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${encodeURIComponent(bomEncoded)}/`;
 
                 await page.goto(bomSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                await sleep(1500);
+                await sleep(2000); // Wait for SPA React components to render
+
+                // Debug: log current URL and page title for first BT of each HG
+                if (bt === bildtafeln[0]) {
+                  const curUrl = page.url();
+                  const title = await page.title();
+                  logger.info(`      ⚡ DEBUG first BT page: title="${title}", url=${curUrl.substring(0, 80)}...`);
+                }
 
                 // Extract OEMs from DOM using the proven _value_ span method
                 const oems = await page.evaluate(`
@@ -291,9 +305,10 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                   const inserted = insertResults(jobId, rows);
                   incrementJobParts(jobId, inserted);
                   totalOems += inserted;
+                  logger.info(`      ⚡ BT ${bt.values?.illustrationNumber || '?'}: ${oems.length} OEMs (total: ${totalOems})`);
                 }
               } catch (err: any) {
-                // Single BT failure — continue
+                logger.warn(`      ⚡ BT error: ${err.message?.substring(0, 80)}`);
               }
 
               // Small delay between BT pages
