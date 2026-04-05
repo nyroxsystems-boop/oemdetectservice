@@ -20,7 +20,7 @@ import {
   getResults, getAllResultsForExport, getBulkStats, getJobProgress,
 } from './bulkStore';
 import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState, discoverBrandsAndModels, crawlSingleBrand } from './bulkCrawler';
-import { crawlBrandViaApi } from './apiCrawler';
+import { crawlBrandViaApi, getApiState } from './apiCrawler';
 import { PL24_SERVICE_MAP } from './scraper';
 import { seedAllVins, getVinCount } from './vinSeeder';
 
@@ -207,14 +207,21 @@ app.post('/api/cache/cleanup', (_req: Request, res: Response) => {
 // ── GET /api/bulk/status ────────────────────────────────────────────────────
 
 app.get('/api/bulk/status', (_req: Request, res: Response) => {
-  const state = getBulkState();
+  const browserState = getBulkState();
+  const apiState = getApiState();
   const stats = getBulkStats();
   const active = getActiveJob();
 
+  // Merge browser + API state
+  const running = browserState.running || apiState.running;
+  const currentBrand = apiState.currentBrand || browserState.currentBrand || null;
+
   res.json({
-    running: state.running,
-    paused: state.paused,
+    running,
+    paused: browserState.paused,
     currentJob: active || null,
+    currentBrand,
+    mode: apiState.running ? 'api' : browserState.running ? 'browser' : 'idle',
     ...stats,
   });
 });

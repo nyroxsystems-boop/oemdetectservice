@@ -34,8 +34,18 @@ import {
 } from './scraper';
 import {
   insertResults, incrementJobParts, createJob, updateJobStatus,
-  getJob, upsertVehicle,
+  getJob, upsertVehicle, getBulkStats,
 } from './bulkStore';
+
+// ── Shared state with bulkCrawler (import the setters) ───────────────────────
+// We need to set bulkRunning/currentBrand so the UI shows the correct status
+
+let apiRunning = false;
+let apiCurrentBrand: string | null = null;
+
+export function getApiState() {
+  return { running: apiRunning, currentBrand: apiCurrentBrand };
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -102,6 +112,9 @@ export async function crawlBrandViaApi(brand: string): Promise<{
   const errors: string[] = [];
   let modelsFound = 0;
 
+  apiRunning = true;
+  apiCurrentBrand = brandUpper;
+
   try {
     // Step 1: Login (reuses existing session if valid)
     let loggedIn = await ensureLoggedIn(page);
@@ -125,9 +138,14 @@ export async function crawlBrandViaApi(brand: string): Promise<{
       `/p5vwag/extern/vehicle/modelfamilies?lang=de&localMarketOnly=true&serviceName=${serviceName}&upds=${upds}`
     );
 
+    // Filter: keep all models with a caption and a link, skip catalog info entries
+    const skipNames = ['Sonderkataloge', 'Elektrische Verbind.', 'Chemische Stoffe',
+      'Serviceteile', 'Kataloginformationen', 'V-Seiten', 'MSP-Seiten'];
     const models = modelsResp.data.records.filter(r =>
-      r.values?.caption && !r.unavailable &&
-      !['Sonderkataloge', 'Elektrische Verbind.', 'Chemische Stoffe', 'Serviceteile'].includes(r.values.caption)
+      r.values?.caption &&
+      r.link?.path &&
+      !skipNames.includes(r.values.caption)
+      // NOTE: removed !r.unavailable — was filtering out most models
     );
     modelsFound = models.length;
     logger.info(`⚡ ${brandUpper}: ${models.length} models found`);
@@ -266,6 +284,8 @@ export async function crawlBrandViaApi(brand: string): Promise<{
     logger.info(`${'═'.repeat(60)}\n`);
 
   } finally {
+    apiRunning = false;
+    apiCurrentBrand = null;
     await page.close();
   }
 
