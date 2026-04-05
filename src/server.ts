@@ -20,6 +20,7 @@ import {
   getResults, getAllResultsForExport, getBulkStats, getJobProgress,
 } from './bulkStore';
 import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState, discoverBrandsAndModels, crawlSingleBrand } from './bulkCrawler';
+import { crawlBrandViaApi } from './apiCrawler';
 import { PL24_SERVICE_MAP } from './scraper';
 import { seedAllVins, getVinCount } from './vinSeeder';
 
@@ -271,20 +272,30 @@ app.get('/api/bulk/brands', (_req: Request, res: Response) => {
 // ── POST /api/bulk/crawl-brand — Crawl a single brand completely ─────────────
 
 app.post('/api/bulk/crawl-brand', async (req: Request, res: Response) => {
-  const { brand } = req.body;
+  const { brand, mode } = req.body;
   if (!brand) return res.status(400).json({ error: 'brand required (e.g., "VW", "AUDI", "BMW")' });
 
-  logger.info(`🏭 Starting brand crawl: ${brand}`);
-  try {
-    // Return immediately with status, run crawl in background
-    res.json({ success: true, message: `Crawl started for ${brand}. Check logs for progress. Use GET /api/bulk/status for state.` });
+  const useApi = mode === 'api';
+  logger.info(`🏭 Starting brand crawl: ${brand} (mode: ${useApi ? 'API ⚡' : 'Browser 🌐'})`);
 
-    // Run the crawl in background
-    crawlSingleBrand(brand).then(result => {
-      logger.info(`🏁 Brand crawl complete: ${brand}`, result);
-    }).catch(err => {
-      logger.error(`❌ Brand crawl failed: ${brand}`, { error: err.message });
-    });
+  try {
+    res.json({ success: true, mode: useApi ? 'api' : 'browser', message: `Crawl started for ${brand} in ${useApi ? 'API' : 'Browser'} mode.` });
+
+    if (useApi) {
+      // ⚡ API mode — 10-20x faster, direct REST API calls
+      crawlBrandViaApi(brand).then(result => {
+        logger.info(`🏁 API crawl complete: ${brand}`, result);
+      }).catch(err => {
+        logger.error(`❌ API crawl failed: ${brand}`, { error: err.message });
+      });
+    } else {
+      // 🌐 Browser mode — original Playwright UI scraping
+      crawlSingleBrand(brand).then(result => {
+        logger.info(`🏁 Browser crawl complete: ${brand}`, result);
+      }).catch(err => {
+        logger.error(`❌ Browser crawl failed: ${brand}`, { error: err.message });
+      });
+    }
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
