@@ -208,7 +208,9 @@ export async function crawlBrandViaApi(brand: string): Promise<{
       const modelName = model.values.caption;
       if (!model.link?.path) continue;
 
-      logger.info(`\n⚡ [${mi + 1}/${models.length}] ${modelName}`);
+      logger.info(`\n${'─'.repeat(50)}`);
+      logger.info(`⚡ [${mi + 1}/${models.length}] ${modelName}`);
+      logger.info(`  API path: ${model.link?.path?.substring(0, 80)}`);
 
       try {
         // Get years
@@ -286,22 +288,66 @@ export async function crawlBrandViaApi(brand: string): Promise<{
               if (!bt.link?.path) continue;
               if (apiAborted) break;
 
+              const btIdx = bildtafeln.indexOf(bt);
+              const btIllus = (bt.values?.illustrationNumber || '').replace(/\\/g, '');
+              const btCaption = (bt.values?.captions || '').split('\n')[0].trim();
+              const btSubgroup = bt.values?.subgroup || '';
+
               try {
-                // Step 1: Navigate to HG Bildtafel list page (go back each time for clean state)
+                // Step 1: Navigate to HG Bildtafel list page
+                logger.info(`      [${btIdx + 1}/${bildtafeln.length}] BT ${btIllus} "${btCaption}" (UG:${btSubgroup})`);
+                logger.info(`        → Step 1: goto HG page: ${hgSpaUrl.substring(0, 80)}...`);
+
                 await page.goto(hgSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
                 await sleep(1500);
 
-                // Step 2: Click the Bildtafel row by its illustration number or caption
-                const btIllus = bt.values?.illustrationNumber || '';
-                const btCaption = bt.values?.captions || '';
-                const btSubgroup = bt.values?.subgroup || '';
+                const postGotoUrl = page.url();
+                const isDemo = postGotoUrl.includes('/demo');
+                logger.info(`        → Step 1 result: ${isDemo ? '⚠️ DEMO' : '✅ Auth'} url=${postGotoUrl.substring(0, 70)}`);
 
-                // Try clicking by caption (most unique), then illustration number parts
+                if (isDemo) {
+                  logger.warn(`        → ⚠️ DEMO MODE detected! Skipping BT ${btIllus}. Session may be expired.`);
+                  // Try re-clicking the brand link to refresh session
+                  if (btIdx === 0) {
+                    logger.info(`        → 🔄 Attempting session refresh via brand link click...`);
+                    await page.goto(`https://www.partslink24.com/partslink24/user/brandMenu.do`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                    await sleep(1000);
+                    const brandLinkClicked2 = await page.evaluate(`
+                      (() => {
+                        const links = document.querySelectorAll('a[href*="launchCatalog"][href*="${serviceName}"]');
+                        if (links.length > 0) { links[0].click(); return true; }
+                        return false;
+                      })()
+                    `) as any as boolean;
+                    if (brandLinkClicked2) {
+                      try { await page.waitForURL(/\/pl24-app\//, { timeout: 10000 }); } catch {}
+                      await sleep(2000);
+                      logger.info(`        → 🔄 Session refresh done. Retrying HG page...`);
+                      await page.goto(hgSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                      await sleep(1500);
+                      const retryUrl = page.url();
+                      logger.info(`        → 🔄 Retry result: ${retryUrl.includes('/demo') ? '⚠️ STILL DEMO' : '✅ Auth'}`);
+                      if (retryUrl.includes('/demo')) {
+                        logger.error(`        → ❌ Session refresh failed. Skipping remaining BTs for this HG.`);
+                        break;
+                      }
+                    }
+                  } else {
+                    continue; // Skip this BT, session is lost
+                  }
+                }
+
+                // Step 2: Click the Bildtafel row
+                logger.info(`        → Step 2: clicking BT row (caption="${btCaption.substring(0, 30)}", illus="${btIllus}")`);
+
                 let clicked = false;
+                let clickMethod = 'none';
+
+                // Method 1: Click by caption text
                 if (btCaption) {
                   clicked = await page.evaluate(`
                     (() => {
-                      const searchText = ${JSON.stringify(btCaption.split('\n')[0].trim())};
+                      const searchText = ${JSON.stringify(btCaption)};
                       const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
                       for (const s of spans) {
                         if (s.children.length === 0 && s.textContent?.trim() === searchText) {
@@ -313,11 +359,12 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                       return false;
                     })()
                   `) as any as boolean;
+                  if (clicked) clickMethod = 'caption';
                 }
 
+                // Method 2: Click by illustration number second part
                 if (!clicked && btIllus) {
-                  // Try clicking by illustration number parts (e.g., "100" from "100-010")
-                  const illusParts = btIllus.replace(/\\/g, '').split('-');
+                  const illusParts = btIllus.split('-');
                   if (illusParts.length >= 2) {
                     clicked = await page.evaluate(`
                       (() => {
@@ -333,20 +380,47 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                         return false;
                       })()
                     `) as any as boolean;
+                    if (clicked) clickMethod = `illus-part2(${illusParts[1]})`;
                   }
                 }
 
-                if (!clicked) continue;
-                await sleep(1500);
-
-                // Debug: log for first BT of each HG
-                if (bt === bildtafeln[0]) {
-                  const curUrl = page.url();
-                  const isDemo = curUrl.includes('/demo');
-                  logger.info(`      ⚡ First BT click: ${isDemo ? '⚠️ DEMO' : '✅ Auth'} url=${curUrl.substring(0, 60)}`);
+                // Method 3: Click by illustration number first part
+                if (!clicked && btIllus) {
+                  const illusParts = btIllus.split('-');
+                  if (illusParts.length >= 1) {
+                    clicked = await page.evaluate(`
+                      (() => {
+                        const part1 = ${JSON.stringify(illusParts[0])};
+                        const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
+                        for (const s of spans) {
+                          if (s.children.length === 0 && s.textContent?.trim() === part1) {
+                            const row = s.closest('[class*="_row_"], [class*="_line_"], [class*="Row"], tr') || s.parentElement?.parentElement;
+                            if (row) { row.click(); return true; }
+                            s.click(); return true;
+                          }
+                        }
+                        return false;
+                      })()
+                    `) as any as boolean;
+                    if (clicked) clickMethod = `illus-part1(${illusParts[0]})`;
+                  }
                 }
 
-                // Step 3: Extract OEMs from DOM using the proven _value_ span method
+                if (!clicked) {
+                  logger.warn(`        → Step 2 FAILED: could not click BT ${btIllus} "${btCaption}" — no matching DOM element`);
+                  continue;
+                }
+
+                logger.info(`        → Step 2 OK: clicked via ${clickMethod}`);
+                await sleep(1500);
+
+                // Verify we're on the BOM page (URL should have changed)
+                const postClickUrl = page.url();
+                const clickedDemo = postClickUrl.includes('/demo');
+                logger.info(`        → Post-click URL: ${postClickUrl.substring(0, 70)}${clickedDemo ? ' ⚠️ DEMO' : ''}`);
+
+                // Step 3: Extract OEMs from DOM
+                logger.info(`        → Step 3: extracting OEMs from DOM...`);
                 const oems = await page.evaluate(`
                   (() => {
                     const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
@@ -381,28 +455,36 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                   })()
                 `) as any as Array<{ oem: string; description: string }>;
 
+                logger.info(`        → Step 3 result: ${oems.length} OEMs found`);
+
                 if (oems.length > 0) {
-                  const btNumber = bt.values?.illustrationNumber || '';
                   const rows = oems.map(o => ({
                     vin: vehicleVin,
                     brand: brandUpper,
                     model: modelName,
                     oem: o.oem,
                     description: o.description,
-                    bildtafel: btNumber,
+                    bildtafel: btIllus,
                     hg_code: hgName.match(/^(\d)/)?.[1] || '',
                     hg_name: hgName,
-                    fg_code: bt.values?.subgroup || '',
-                    fg_name: bt.values?.captions || '',
+                    fg_code: btSubgroup,
+                    fg_name: btCaption,
                   }));
 
                   const inserted = insertResults(jobId, rows);
                   incrementJobParts(jobId, inserted);
                   totalOems += inserted;
-                  logger.info(`      ⚡ BT ${bt.values?.illustrationNumber || '?'}: ${oems.length} OEMs (total: ${totalOems})`);
+                  logger.info(`      ✅ BT ${btIllus}: ${oems.length} OEMs stored (${inserted} new, total: ${totalOems})`);
+                  if (oems.length <= 3) {
+                    oems.forEach(o => logger.info(`         ${o.oem} — ${o.description?.substring(0, 40)}`));
+                  } else {
+                    logger.info(`         ${oems[0].oem} — ${oems[0].description?.substring(0, 40)} ... +${oems.length - 1} more`);
+                  }
+                } else {
+                  logger.info(`      ○ BT ${btIllus}: 0 OEMs (page may not have loaded correctly)`);
                 }
               } catch (err: any) {
-                logger.warn(`      ⚡ BT error: ${err.message?.substring(0, 80)}`);
+                logger.error(`      ❌ BT ${btIllus} error: ${err.message?.substring(0, 100)}`);
               }
 
               // Small delay between BT pages
