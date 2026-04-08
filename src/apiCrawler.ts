@@ -42,15 +42,25 @@ import {
 
 let apiRunning = false;
 let apiCurrentBrand: string | null = null;
+let apiPaused = false;
 
 export function getApiState() {
-  return { running: apiRunning, currentBrand: apiCurrentBrand };
+  return { running: apiRunning, currentBrand: apiCurrentBrand, paused: apiPaused };
 }
 
 export function cancelApi(): void {
   apiRunning = false;
   apiCurrentBrand = null;
   apiAborted = true;
+  apiPaused = false;
+}
+
+export function pauseApi(): void {
+  apiPaused = true;
+}
+
+export function resumeApi(): void {
+  apiPaused = false;
 }
 
 let apiAborted = false;
@@ -366,14 +376,21 @@ export async function crawlBrandViaApi(brand: string): Promise<{
     updateJobStatus(jobId, 'running', { total_hg: models.length });
 
     // Step 4: Process each model
+    let restrictionKeysLogged = false;
     for (let mi = 0; mi < models.length; mi++) {
       if (apiAborted) { logger.info('⚡ ABORTED by admin'); break; }
+      // Pause support — chain/admin can pause mid-crawl
+      while (apiPaused && !apiAborted) { await sleep(1000); }
       const model = models[mi];
       const modelName = model.values.caption;
       if (!model.link?.path) continue;
 
+      // Extract internal model code from caption: "A3 (8P)" → "8P", "3er (F30)" → "F30"
+      const modelCodeMatch = modelName.match(/\(([A-Z0-9]{1,5})\)\s*$/);
+      const modelCode = modelCodeMatch?.[1] || null;
+
       logger.info(`\n${'─'.repeat(50)}`);
-      logger.info(`⚡ [${mi + 1}/${models.length}] ${modelName}`);
+      logger.info(`⚡ [${mi + 1}/${models.length}] ${modelName}${modelCode ? ` [code: ${modelCode}]` : ''}`);
       logger.info(`  API path: ${model.link?.path?.substring(0, 80)}`);
 
       try {
@@ -386,16 +403,23 @@ export async function crawlBrandViaApi(brand: string): Promise<{
           continue;
         }
 
-        // Pick most recent year
+        // Compute full year range (all years for this model), then pick most recent for drill-down
+        const yearNums = years
+          .map(y => parseInt(y.values.caption || '0'))
+          .filter(n => n > 1900 && n < 2100);
+        const yearFrom = yearNums.length ? Math.min(...yearNums) : null;
+        const yearTo = yearNums.length ? Math.max(...yearNums) : null;
+
         const sortedYears = years.sort((a, b) =>
           parseInt(b.values.caption || '0') - parseInt(a.values.caption || '0')
         );
         const year = sortedYears[0];
-        logger.info(`  ⚡ Year: ${year.values.caption} (of ${years.length})`);
+        logger.info(`  ⚡ Year range: ${yearFrom}-${yearTo} (using ${year.values.caption} for drill-down, ${years.length} total)`);
 
         // Follow link — might go to HG or restrictions
         let nextResp = await pl24Fetch(page, year.link!.path);
         let nextWid = year.link!.wid || '';
+        let engineLabel: string | null = null;
 
         // Handle restrictions (drill down until we reach maingroups)
         let drillDown = 0;
@@ -407,6 +431,21 @@ export async function crawlBrandViaApi(brand: string): Promise<{
           const captions = nextResp.data.records.map(r => r.values?.caption || '');
           const isHg = captions.some(c => /^\d\s+/.test(c) || /Motor|Getriebe|Karosserie|Elektrik/.test(c));
           if (isHg) break;
+
+          // Capture engine label from the first restriction level we hit.
+          // This is the label of the restriction we *choose* to drill into —
+          // so every OEM scraped below inherits this engine context.
+          if (nextWid.toLowerCase().includes('restriction') ||
+              nextWid.toLowerCase().includes('engine') ||
+              nextWid.toLowerCase().includes('modeltype')) {
+            engineLabel = firstRecord.values?.caption || null;
+            // Log all keys once per brand so we can discover richer engine fields later
+            if (!restrictionKeysLogged) {
+              logger.info(`  ⚡ Restriction fields (first encounter): ${JSON.stringify(Object.keys(firstRecord.values || {}))}`);
+              logger.info(`  ⚡ Restriction values (first encounter): ${JSON.stringify(firstRecord.values).substring(0, 300)}`);
+              restrictionKeysLogged = true;
+            }
+          }
 
           logger.info(`  ⚡ Drill-down: ${firstRecord.values.caption} (wid: ${nextWid})`);
           nextResp = await pl24Fetch(page, firstRecord.link!.path);
@@ -426,6 +465,8 @@ export async function crawlBrandViaApi(brand: string): Promise<{
         // Process each HG
         for (const hg of hgEntries) {
           if (!hg.link?.path) continue;
+          if (apiAborted) break;
+          while (apiPaused && !apiAborted) { await sleep(1000); }
           const hgName = hg.values.caption;
 
           try {
@@ -589,6 +630,10 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                     hg_name: hgName,
                     fg_code: btSubgroup,
                     fg_name: btCaption,
+                    year_from: yearFrom,
+                    year_to: yearTo,
+                    model_code: modelCode,
+                    engine: engineLabel,
                   }));
 
                   const inserted = insertResults(jobId, rows);

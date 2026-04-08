@@ -455,8 +455,17 @@ export async function crawlSingleBrand(brand: string): Promise<{
       const model = models[mi];
       if (bulkPaused) { logger.info('⏸ Paused by admin'); break; }
 
+      // Extract internal model code from caption: "A3 (8P)" → "8P"
+      const modelCodeMatch = model.match(/\(([A-Z0-9]{1,5})\)\s*$/);
+      const modelCode = modelCodeMatch?.[1] || null;
+
+      // These will be populated during year/restriction drill-down below
+      let yearFrom: number | null = null;
+      let yearTo: number | null = null;
+      let engineLabel: string | null = null;
+
       logger.info(`\n${'─'.repeat(50)}`);
-      logger.info(`📦 Model ${mi + 1}/${models.length}: ${brand} ${model}`);
+      logger.info(`📦 Model ${mi + 1}/${models.length}: ${brand} ${model}${modelCode ? ` [code: ${modelCode}]` : ''}`);
       logger.info(`${'─'.repeat(50)}`);
 
       try {
@@ -487,10 +496,16 @@ export async function crawlSingleBrand(brand: string): Promise<{
           maxDrillDown--;
 
           if (level === 'years') {
-            // Pick most recent year
-            const years = values.filter(v => /^\d{4}$/.test(v)).sort((a, b) => parseInt(b) - parseInt(a));
+            // Capture full year range (for AI part matching), then pick most recent for drill-down
+            const yearStrs = values.filter(v => /^\d{4}$/.test(v));
+            const yearNums = yearStrs.map(s => parseInt(s)).filter(n => n > 1900 && n < 2100);
+            if (yearNums.length > 0) {
+              yearFrom = Math.min(...yearNums);
+              yearTo = Math.max(...yearNums);
+            }
+            const years = yearStrs.sort((a, b) => parseInt(b) - parseInt(a));
             if (years.length > 0) {
-              logger.info(`  📅 Selecting year: ${years[0]} (from ${years.length} available)`);
+              logger.info(`  📅 Year range: ${yearFrom}-${yearTo}, drilling into ${years[0]} (from ${years.length} available)`);
               await clickValueRow(page, years[0]);
               values = await logPageState(page, `After year ${years[0]}`);
               level = detectPageLevel(values, page.url());
@@ -516,6 +531,12 @@ export async function crawlSingleBrand(brand: string): Promise<{
 
             logger.info(`  🔍 Restriction/drill-down candidates: ${options.length} (filtered from ${values.length} total)`);
             if (options.length > 0) {
+              // Capture the first restriction label as engine context
+              // (it's the one we're actually drilling into)
+              if (level === 'restrictions' && !engineLabel) {
+                engineLabel = options[0];
+                logger.info(`  🔧 Engine/restriction: "${engineLabel}"`);
+              }
               logger.info(`  🔽 Drill-down: clicking "${options[0]}" (from: ${options.slice(0, 5).join(', ')})`);
               await clickValueRow(page, options[0]);
               values = await logPageState(page, `After drill-down "${options[0]}"`);
@@ -678,6 +699,8 @@ export async function crawlSingleBrand(brand: string): Promise<{
                         bildtafel: bt.bt,
                         hg_code: hg.code, hg_name: hg.name,
                         fg_code: bt.ug, fg_name: bt.name,
+                        year_from: yearFrom, year_to: yearTo,
+                        model_code: modelCode, engine: engineLabel,
                       }));
                       const inserted = insertResults(jobId, rows);
                       incrementJobParts(jobId, inserted);
@@ -764,6 +787,8 @@ export async function crawlSingleBrand(brand: string): Promise<{
                         bildtafel: ug.code,
                         hg_code: hg.code, hg_name: hg.name,
                         fg_code: ug.code, fg_name: ug.name,
+                        year_from: yearFrom, year_to: yearTo,
+                        model_code: modelCode, engine: engineLabel,
                       }));
                       const inserted = insertResults(jobId, rows);
                       incrementJobParts(jobId, inserted);
@@ -802,6 +827,8 @@ export async function crawlSingleBrand(brand: string): Promise<{
                   bildtafel: undefined,
                   hg_code: hg.code, hg_name: hg.name,
                   fg_code: undefined, fg_name: undefined,
+                  year_from: yearFrom, year_to: yearTo,
+                  model_code: modelCode, engine: engineLabel,
                 }));
                 const inserted = insertResults(jobId, rows);
                 incrementJobParts(jobId, inserted);

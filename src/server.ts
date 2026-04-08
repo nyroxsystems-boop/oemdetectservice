@@ -20,7 +20,8 @@ import {
   getResults, getAllResultsForExport, getBulkStats, getJobProgress,
 } from './bulkStore';
 import { startCrawl, pauseBulk, resumeBulk, cancelBulk, getBulkState, discoverBrandsAndModels, crawlSingleBrand } from './bulkCrawler';
-import { crawlBrandViaApi, getApiState, cancelApi } from './apiCrawler';
+import { crawlBrandViaApi, getApiState, cancelApi, pauseApi, resumeApi } from './apiCrawler';
+import { startBrandChain, getChainState, isChainActive, pauseChain, resumeChain, cancelChain } from './brandChain';
 import { PL24_SERVICE_MAP } from './scraper';
 import { seedAllVins, getVinCount } from './vinSeeder';
 
@@ -306,6 +307,58 @@ app.post('/api/bulk/crawl-brand', async (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Brand Chain (auto-continue) ─────────────────────────────────────────────
+// POST /api/bulk/chain/start  { startBrand, mode }
+// Starts a sequential crawl beginning at `startBrand` and running through all
+// subsequent brands in PL24_SERVICE_MAP. Fire-and-forget — chain state is
+// queryable via /api/bulk/chain/state.
+app.post('/api/bulk/chain/start', async (req: Request, res: Response) => {
+  const { startBrand, mode } = req.body || {};
+  if (!startBrand) return res.status(400).json({ error: 'startBrand required' });
+
+  if (isChainActive()) {
+    return res.status(409).json({ error: 'Chain already running', state: getChainState() });
+  }
+  // Guard against overlap with single-brand runs
+  const apiSt = getApiState();
+  const bulkSt = getBulkState();
+  if (apiSt.running || bulkSt.running) {
+    return res.status(409).json({
+      error: 'Another crawl is already running — cancel it before starting a chain',
+      apiRunning: apiSt.running,
+      bulkRunning: bulkSt.running,
+    });
+  }
+
+  try {
+    await startBrandChain(startBrand, mode === 'browser' ? 'browser' : 'api');
+    const st = getChainState();
+    logger.info(`🔗 Chain started via API: ${startBrand} (mode: ${st.mode}, queue: ${st.brands.length})`);
+    return res.json({ success: true, state: st });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/bulk/chain/pause', (_req: Request, res: Response) => {
+  pauseChain();
+  return res.json({ success: true, state: getChainState() });
+});
+
+app.post('/api/bulk/chain/resume', (_req: Request, res: Response) => {
+  resumeChain();
+  return res.json({ success: true, state: getChainState() });
+});
+
+app.post('/api/bulk/chain/cancel', (_req: Request, res: Response) => {
+  cancelChain();
+  return res.json({ success: true, state: getChainState() });
+});
+
+app.get('/api/bulk/chain/state', (_req: Request, res: Response) => {
+  return res.json(getChainState());
 });
 
 app.post('/api/bulk/vehicles/seed', (_req: Request, res: Response) => {

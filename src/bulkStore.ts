@@ -78,6 +78,11 @@ export interface BulkResultRow {
   hg_name: string | null;
   fg_code: string | null;
   fg_name: string | null;
+  // Vehicle enrichment (added 2026-04 for AI part matching by VIN/year/engine)
+  year_from: number | null;
+  year_to: number | null;
+  model_code: string | null;
+  engine: string | null;
   created_at: string;
 }
 
@@ -176,6 +181,22 @@ export function initBulkStore(): void {
     CREATE INDEX IF NOT EXISTS idx_results_oem ON bulk_results(oem);
     CREATE INDEX IF NOT EXISTS idx_results_brand ON bulk_results(brand);
   `);
+
+  // Vehicle enrichment columns — SQLite lacks ADD COLUMN IF NOT EXISTS,
+  // so we inspect PRAGMA table_info and ALTER conditionally.
+  const addColumnIfMissing = (table: string, column: string, definition: string) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!cols.some(c => c.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+      logger.info(`[Migration] Added column ${table}.${column}`);
+    }
+  };
+  addColumnIfMissing('bulk_results', 'year_from', 'INTEGER');
+  addColumnIfMissing('bulk_results', 'year_to', 'INTEGER');
+  addColumnIfMissing('bulk_results', 'model_code', 'TEXT');
+  addColumnIfMissing('bulk_results', 'engine', 'TEXT');
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_results_model_code ON bulk_results(model_code)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_results_year ON bulk_results(year_from, year_to)`);
 
   const vehicleCount = (db.prepare('SELECT COUNT(*) as c FROM vehicles').get() as any)?.c || 0;
   const resultCount = (db.prepare('SELECT COUNT(*) as c FROM bulk_results').get() as any)?.c || 0;
@@ -446,11 +467,13 @@ export function insertResults(jobId: number, rows: Array<{
   vin: string; brand: string; model: string;
   oem: string; description?: string; bildtafel?: string;
   hg_code?: string; hg_name?: string; fg_code?: string; fg_name?: string;
+  year_from?: number | null; year_to?: number | null;
+  model_code?: string | null; engine?: string | null;
 }>): number {
   const stmt = db.prepare(`
     INSERT OR IGNORE INTO bulk_results
-      (job_id, vin, brand, model, oem, description, bildtafel, hg_code, hg_name, fg_code, fg_name)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (job_id, vin, brand, model, oem, description, bildtafel, hg_code, hg_name, fg_code, fg_name, year_from, year_to, model_code, engine)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   let inserted = 0;
@@ -461,7 +484,9 @@ export function insertResults(jobId: number, rows: Array<{
         r.oem.replace(/\s+/g, ' ').trim(),
         r.description || null, r.bildtafel || null,
         r.hg_code || null, r.hg_name || null,
-        r.fg_code || null, r.fg_name || null
+        r.fg_code || null, r.fg_name || null,
+        r.year_from ?? null, r.year_to ?? null,
+        r.model_code || null, r.engine || null
       );
       if (result.changes > 0) inserted++;
     }
@@ -480,6 +505,8 @@ export function insertResults(jobId: number, rows: Array<{
 async function autoExportToOemDb(rows: Array<{
   oem: string; brand: string; model: string; description?: string;
   hg_code?: string; hg_name?: string; fg_code?: string; fg_name?: string;
+  year_from?: number | null; year_to?: number | null;
+  model_code?: string | null; engine?: string | null;
 }>): Promise<void> {
   const { config } = require('./config');
   const wwsUrl = config.wwsBotUrl;
@@ -502,6 +529,10 @@ async function autoExportToOemDb(rows: Array<{
     model: r.model,
     description: r.description,
     part_category: HG_CATEGORY_MAP[r.hg_code || ''] || r.hg_name?.toLowerCase() || 'other',
+    model_code: r.model_code || null,
+    year_from: r.year_from ?? null,
+    year_to: r.year_to ?? null,
+    engine: r.engine || null,
   }));
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
