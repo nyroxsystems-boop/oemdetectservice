@@ -31,13 +31,18 @@ export async function initOemDb(): Promise<boolean> {
     }
 
     try {
+        // Railway private networking uses plain TCP (no SSL), but the public
+        // proxy (mainline.proxy.rlwy.net) requires SSL. Detect by hostname.
+        const isPrivate = url.includes('.railway.internal');
         pool = new Pool({
             connectionString: url,
-            ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
+            ssl: isPrivate ? false : { rejectUnauthorized: false },
             max: 10,
             idleTimeoutMillis: 30000,
             connectionTimeoutMillis: 10000,
         });
+
+        logger.info(`[OEM-DB] Connecting to ${isPrivate ? 'private' : 'public'} PostgreSQL...`);
 
         // Test connection
         const client = await pool.connect();
@@ -48,8 +53,10 @@ export async function initOemDb(): Promise<boolean> {
             client.release();
         }
         return true;
-    } catch (err) {
-        logger.error('[OEM-DB] ❌ Failed to connect:', err);
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(`[OEM-DB] ❌ Failed to connect: ${msg}`);
+        logger.error(`[OEM-DB] URL pattern: ${url.replace(/:[^@]+@/, ':***@')}`);
         pool = null;
         return false;
     }
