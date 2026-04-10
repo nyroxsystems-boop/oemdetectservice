@@ -146,6 +146,74 @@ async function runMigrations(client: import('pg').PoolClient): Promise<void> {
             }
         }
     }
+
+    // ── Migration 002: Vehicle master data + extended fitment columns ──
+    if (!applied.has('002_vehicle_master')) {
+        logger.info('[OEM-DB] Applying migration: 002_vehicle_master');
+        await client.query('BEGIN');
+        try {
+            await client.query(`
+                -- Vehicle master table: one row per unique vehicle variant
+                -- Enables "which parts fit my car" lookups by KBA, VIN, or make/model
+                CREATE TABLE IF NOT EXISTS vehicles (
+                    id SERIAL PRIMARY KEY,
+                    make VARCHAR(100) NOT NULL,
+                    model VARCHAR(200) NOT NULL,
+                    model_code VARCHAR(50),
+                    variant VARCHAR(200),
+                    body_type VARCHAR(50),
+                    year_from INTEGER,
+                    year_to INTEGER,
+                    engine_code VARCHAR(50),
+                    engine_description VARCHAR(200),
+                    displacement_cc INTEGER,
+                    power_kw INTEGER,
+                    power_ps INTEGER,
+                    fuel_type VARCHAR(30),
+                    transmission VARCHAR(50),
+                    drive_type VARCHAR(30),
+                    hsn VARCHAR(10),
+                    tsn VARCHAR(10),
+                    kba_number VARCHAR(20),
+                    source VARCHAR(100),
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(make, model, year_from, engine_code, hsn, tsn)
+                );
+
+                -- Extend vehicle_fitments with a vehicle_id FK
+                ALTER TABLE vehicle_fitments ADD COLUMN IF NOT EXISTS vehicle_id INTEGER REFERENCES vehicles(id);
+                ALTER TABLE vehicle_fitments ADD COLUMN IF NOT EXISTS engine_code VARCHAR(50);
+                ALTER TABLE vehicle_fitments ADD COLUMN IF NOT EXISTS displacement_cc INTEGER;
+                ALTER TABLE vehicle_fitments ADD COLUMN IF NOT EXISTS power_kw INTEGER;
+                ALTER TABLE vehicle_fitments ADD COLUMN IF NOT EXISTS fuel_type VARCHAR(30);
+                ALTER TABLE vehicle_fitments ADD COLUMN IF NOT EXISTS body_type VARCHAR(50);
+                ALTER TABLE vehicle_fitments ADD COLUMN IF NOT EXISTS kba_number VARCHAR(20);
+
+                -- Extend oem_numbers with aftermarket brand cross-ref count
+                ALTER TABLE oem_numbers ADD COLUMN IF NOT EXISTS cross_ref_count INTEGER DEFAULT 0;
+
+                -- Indexes
+                CREATE INDEX IF NOT EXISTS idx_vehicles_make_model ON vehicles(make, model);
+                CREATE INDEX IF NOT EXISTS idx_vehicles_hsn_tsn ON vehicles(hsn, tsn);
+                CREATE INDEX IF NOT EXISTS idx_vehicles_kba ON vehicles(kba_number);
+                CREATE INDEX IF NOT EXISTS idx_vehicles_engine ON vehicles(engine_code);
+                CREATE INDEX IF NOT EXISTS idx_fit_vehicle_id ON vehicle_fitments(vehicle_id);
+                CREATE INDEX IF NOT EXISTS idx_fit_kba ON vehicle_fitments(kba_number);
+            `);
+            await client.query("INSERT INTO schema_migrations (name) VALUES ('002_vehicle_master')");
+            await client.query('COMMIT');
+            logger.info('[OEM-DB] ✅ 002_vehicle_master applied');
+        } catch (err) {
+            await client.query('ROLLBACK');
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('already exists')) {
+                await client.query("INSERT INTO schema_migrations (name) VALUES ('002_vehicle_master') ON CONFLICT DO NOTHING");
+                logger.warn('[OEM-DB] 002 tables already exist — marked as applied');
+            } else {
+                logger.error(`[OEM-DB] 002_vehicle_master FAILED: ${msg}`);
+            }
+        }
+    }
 }
 
 // ── Insert Functions ─────────────────────────────────────────
@@ -204,6 +272,62 @@ export async function insertFitment(data: {
         );
     } catch (err) {
         logger.warn('[OEM-DB] Insert fitment failed:', err instanceof Error ? err.message : err);
+    }
+}
+
+/**
+ * Upsert a vehicle into the master table. Returns the vehicle ID.
+ */
+export async function upsertVehicle(data: {
+    make: string;
+    model: string;
+    model_code?: string | null;
+    variant?: string | null;
+    body_type?: string | null;
+    year_from?: number | null;
+    year_to?: number | null;
+    engine_code?: string | null;
+    engine_description?: string | null;
+    displacement_cc?: number | null;
+    power_kw?: number | null;
+    power_ps?: number | null;
+    fuel_type?: string | null;
+    transmission?: string | null;
+    drive_type?: string | null;
+    hsn?: string | null;
+    tsn?: string | null;
+    kba_number?: string | null;
+    source?: string | null;
+}): Promise<number | null> {
+    if (!pool) return null;
+    try {
+        const result = await pool.query(
+            `INSERT INTO vehicles (make, model, model_code, variant, body_type, year_from, year_to,
+                engine_code, engine_description, displacement_cc, power_kw, power_ps,
+                fuel_type, transmission, drive_type, hsn, tsn, kba_number, source)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+             ON CONFLICT (make, model, year_from, engine_code, hsn, tsn)
+             DO UPDATE SET
+                model_code = COALESCE(EXCLUDED.model_code, vehicles.model_code),
+                engine_description = COALESCE(EXCLUDED.engine_description, vehicles.engine_description),
+                displacement_cc = COALESCE(EXCLUDED.displacement_cc, vehicles.displacement_cc),
+                power_kw = COALESCE(EXCLUDED.power_kw, vehicles.power_kw),
+                power_ps = COALESCE(EXCLUDED.power_ps, vehicles.power_ps),
+                fuel_type = COALESCE(EXCLUDED.fuel_type, vehicles.fuel_type)
+             RETURNING id`,
+            [
+                data.make, data.model, data.model_code || null, data.variant || null,
+                data.body_type || null, data.year_from || null, data.year_to || null,
+                data.engine_code || null, data.engine_description || null,
+                data.displacement_cc || null, data.power_kw || null, data.power_ps || null,
+                data.fuel_type || null, data.transmission || null, data.drive_type || null,
+                data.hsn || null, data.tsn || null, data.kba_number || null, data.source || null,
+            ]
+        );
+        return result.rows[0]?.id || null;
+    } catch (err) {
+        logger.warn('[OEM-DB] Upsert vehicle failed:', err instanceof Error ? err.message : err);
+        return null;
     }
 }
 
