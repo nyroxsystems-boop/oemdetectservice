@@ -105,7 +105,7 @@ async function runMigrations(client: import('pg').PoolClient): Promise<void> {
                     source VARCHAR(100),
                     confidence REAL DEFAULT 0.5,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(oem_number, cross_number, COALESCE(cross_brand, ''))
+                    UNIQUE(oem_number, cross_number)
                 );
 
                 CREATE TABLE IF NOT EXISTS vehicle_fitments (
