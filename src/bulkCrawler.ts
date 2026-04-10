@@ -25,6 +25,7 @@ import {
   incrementJobParts, incrementJobErrors, incrementJobCompletedHg,
   getNextQueuedJob, getJobProgress, upsertVehicle, createJob,
 } from './bulkStore';
+import { bulkInsertResults } from './oemDb';
 
 // ── State ────────────────────────────────────────────────────────────────────
 
@@ -705,6 +706,8 @@ export async function crawlSingleBrand(brand: string): Promise<{
                       const inserted = insertResults(jobId, rows);
                       incrementJobParts(jobId, inserted);
                       totalOems += inserted;
+                      // Push to OEM PostgreSQL for long-term storage (fire-and-forget)
+                      bulkInsertResults(rows).catch(() => {});
                       logger.info(`    │ ✅ BT ${bt.bt}: ${inserted} OEMs stored (total: ${totalOems})`);
                       oems.slice(0, 3).forEach(o => logger.info(`    │    ${o.oem} — ${o.description}`));
                     } else {
@@ -793,6 +796,7 @@ export async function crawlSingleBrand(brand: string): Promise<{
                       const inserted = insertResults(jobId, rows);
                       incrementJobParts(jobId, inserted);
                       totalOems += inserted;
+                      bulkInsertResults(rows).catch(() => {});
                       logger.info(`    │ ✅ UG ${ug.code}: ${inserted} OEMs stored (total: ${totalOems})`);
                       oems.slice(0, 3).forEach(o => logger.info(`    │    ${o.oem} — ${o.description}`));
                       if (oems.length > 3) logger.info(`    │    ... and ${oems.length - 3} more`);
@@ -833,6 +837,7 @@ export async function crawlSingleBrand(brand: string): Promise<{
                 const inserted = insertResults(jobId, rows);
                 incrementJobParts(jobId, inserted);
                 totalOems += inserted;
+                bulkInsertResults(rows).catch(() => {});
               }
               logger.info(`    │ ✅ Direct parts page: ${oems.length} OEMs`);
             } else {

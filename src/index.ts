@@ -17,6 +17,7 @@ import { logger } from './logger';
 import { initCache, cleanupExpired } from './cache';
 import { initBulkStore, recoverRunningJobs } from './bulkStore';
 import { initBrowser, closeBrowser } from './scraper';
+import { initOemDb, closeOemDb } from './oemDb';
 import { app } from './server';
 import fs from 'fs';
 import path from 'path';
@@ -33,10 +34,18 @@ async function main() {
   }
 
   // Step 1: Initialize databases
-  logger.info('Step 1/3: Initializing databases...');
+  logger.info('Step 1/4: Initializing databases...');
   initCache();
   initBulkStore();
   recoverRunningJobs();
+
+  // Step 1b: Connect OEM PostgreSQL (separate DB for persistent OEM data)
+  const oemDbOk = await initOemDb();
+  if (oemDbOk) {
+    logger.info('✅ OEM PostgreSQL connected — scraped data will be persisted');
+  } else {
+    logger.warn('⚠️  OEM PostgreSQL not available — using SQLite only');
+  }
 
   // Step 2: Start API server FIRST (so health check works)
   logger.info('Step 2/3: Starting API server...');
@@ -82,6 +91,7 @@ async function main() {
 async function shutdown(signal: string) {
   logger.info(`${signal} received — shutting down...`);
   await closeBrowser();
+  await closeOemDb();
   process.exit(0);
 }
 

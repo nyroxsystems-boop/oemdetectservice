@@ -603,4 +603,28 @@ function mapHgToCategory(hgCode: string, hgName: string): string {
   return map[hgCode] || hgName?.toLowerCase() || 'other';
 }
 
+// ── OEM PostgreSQL Search Endpoints ──────────────────────────────────────────
+// These query the separate OEM database (if connected via OEM_DATABASE_URL).
+// The Bot-Service and Admin-Dashboard can call these for fuzzy OEM lookups.
+
+import { searchOem, getOemDbStats } from './oemDb';
+
+app.get('/api/oem/search', async (req: Request, res: Response) => {
+  const q = (req.query.q as string || '').trim();
+  if (q.length < 2) {
+    return res.status(400).json({ error: 'Query must be at least 2 characters' });
+  }
+  const limit = Math.min(100, parseInt(req.query.limit as string || '25', 10));
+  const results = await searchOem(q, limit);
+  res.json({ query: q, results, count: results.length });
+});
+
+app.get('/api/oem/stats', async (_req: Request, res: Response) => {
+  const stats = await getOemDbStats();
+  if (!stats) {
+    return res.json({ status: 'disconnected', message: 'OEM PostgreSQL not connected' });
+  }
+  res.json({ status: 'connected', ...stats });
+});
+
 export { app };
