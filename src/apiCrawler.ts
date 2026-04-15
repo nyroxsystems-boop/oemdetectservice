@@ -99,15 +99,17 @@ let capturedSpaHeaders: Record<string, string> = {};
  * Set up a network interceptor to capture headers from PL24's own API requests.
  * Must be called BEFORE clicking the brand link so we catch the SPA's initial data load.
  *
- * Keeps listening until we have an authorization header — the first SPA request
- * may not carry the Bearer token (e.g. if the SPA bootstraps before auth completes).
+ * Captures BOTH fetch and XHR requests — the SPA may use Axios (which uses XHR)
+ * rather than the native fetch API.
  */
 function setupHeaderCapture(page: Page): void {
   capturedSpaHeaders = {};
 
   page.on('request', (request) => {
     const url = request.url();
-    if (url.includes('/p5vwag/extern/') && request.resourceType() === 'fetch') {
+    const rtype = request.resourceType();
+    // Capture both fetch AND xhr — Axios uses XMLHttpRequest under the hood
+    if (url.includes('/p5vwag/extern/') && (rtype === 'fetch' || rtype === 'xhr')) {
       const headers = request.headers();
 
       // Always grab the full set on first capture
@@ -115,28 +117,26 @@ function setupHeaderCapture(page: Page): void {
         for (const [key, value] of Object.entries(headers)) {
           capturedSpaHeaders[key.toLowerCase()] = value;
         }
-        logger.info(`⚡ Captured ${Object.keys(capturedSpaHeaders).length} SPA headers`);
+        logger.info(`⚡ Captured ${Object.keys(capturedSpaHeaders).length} SPA headers (type: ${rtype})`);
       }
 
-      // Keep updating auth-related headers from subsequent requests until we have one
+      // Keep updating auth-related headers from ALL subsequent requests
       const auth = headers['authorization'] || headers['Authorization'];
-      if (auth && !capturedSpaHeaders['authorization']) {
+      if (auth) {
         capturedSpaHeaders['authorization'] = auth;
-        logger.info(`⚡ Auth header captured from later request: ${auth.substring(0, 40)}...`);
+        logger.info(`⚡ Auth header captured: ${auth.substring(0, 50)}... (type: ${rtype})`);
       }
       const xsrf = headers['x-xsrf-token'] || headers['X-XSRF-TOKEN'];
-      if (xsrf && !capturedSpaHeaders['x-xsrf-token']) {
+      if (xsrf) {
         capturedSpaHeaders['x-xsrf-token'] = xsrf;
       }
 
-      // Log interesting headers
-      if (auth || Object.keys(capturedSpaHeaders).length <= 10) {
-        const interesting = Object.entries(capturedSpaHeaders)
-          .filter(([k]) => k.startsWith('x-') || k === 'authorization' || k.includes('csrf') || k.includes('token'))
-          .map(([k, v]) => `${k}: ${v.substring(0, 30)}`);
-        if (interesting.length > 0) {
-          logger.info(`⚡ Custom headers: ${interesting.join(', ')}`);
-        }
+      // Log interesting headers on first few captures
+      const interesting = Object.entries(headers)
+        .filter(([k]) => k.startsWith('x-') || k === 'authorization' || k.includes('csrf') || k.includes('token') || k.includes('bearer'))
+        .map(([k, v]) => `${k}: ${v.substring(0, 40)}`);
+      if (interesting.length > 0) {
+        logger.info(`⚡ Request headers [${rtype}]: ${interesting.join(', ')}`);
       }
     }
   });
@@ -144,36 +144,43 @@ function setupHeaderCapture(page: Page): void {
 
 /**
  * Call a PL24 API endpoint using the browser's session cookies.
- * Injects the captured Bearer token from the SPA's own requests.
+ * Injects any captured auth headers from the SPA's own requests.
  */
 async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
-  // Pass the captured auth token from Node.js into the browser context
+  // Pass captured auth headers from Node.js into the browser context
   const capturedAuth = capturedSpaHeaders['authorization'] || '';
-  
+  const capturedXsrf = capturedSpaHeaders['x-xsrf-token'] || '';
+
   const result = await page.evaluate(`
     (async function() {
       try {
         const headers = {
           'Accept': 'application/json, text/plain, */*',
-          'X-Requested-With': 'XMLHttpRequest',
-          'Referer': window.location.href,
         };
-        
-        // Inject captured Bearer token from SPA (passed from Node.js)
+
+        // Inject captured auth headers from SPA (passed from Node.js)
         const capturedAuth = ${JSON.stringify(capturedAuth)};
         if (capturedAuth) {
           headers['Authorization'] = capturedAuth;
         }
-        
-        // Also try XSRF-TOKEN from cookies as backup
-        const xsrf = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
-        if (xsrf) headers['X-XSRF-TOKEN'] = decodeURIComponent(xsrf[1]);
-        
+
+        // XSRF-TOKEN: try captured header first, then cookie
+        const capturedXsrf = ${JSON.stringify(capturedXsrf)};
+        if (capturedXsrf) {
+          headers['X-XSRF-TOKEN'] = capturedXsrf;
+        } else {
+          const xsrf = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+          if (xsrf) headers['X-XSRF-TOKEN'] = decodeURIComponent(xsrf[1]);
+        }
+
         const r = await fetch(${JSON.stringify(apiPath)}, {
-          credentials: 'same-origin',
+          credentials: 'include',
           headers,
         });
         if (!r.ok) {
+          // Capture response body — the error message tells us WHY
+          let responseBody = '';
+          try { responseBody = await r.text(); } catch {}
           const respHeaders = {};
           r.headers.forEach((v, k) => { respHeaders[k] = v; });
           return {
@@ -181,9 +188,13 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
             statusText: r.statusText,
             data: { records: [] },
             debug: {
-              cookies: document.cookie.substring(0, 200),
+              responseBody: responseBody.substring(0, 500),
+              responseHeaders: respHeaders,
+              requestUrl: ${JSON.stringify(apiPath)},
+              cookies: document.cookie.substring(0, 500),
               url: window.location.href,
               hasAuth: !!capturedAuth,
+              headersSent: Object.keys(headers).join(', '),
             },
           };
         }
@@ -195,12 +206,24 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
   `) as any;
 
   if (result.error) {
-    // Log debug info for 403 errors
+    // Log comprehensive debug info for 403 errors
     if (result.debug) {
-      logger.warn(`PL24 API ${result.error} debug:`, {
-        cookies: result.debug.cookies?.substring(0, 100),
-        pageUrl: result.debug.url?.substring(0, 60),
+      logger.warn(`PL24 API ${result.error} [${result.statusText}] debug:`, {
+        responseBody: result.debug.responseBody?.substring(0, 200),
+        cookies: result.debug.cookies?.substring(0, 150),
+        pageUrl: result.debug.url?.substring(0, 80),
+        hasAuth: result.debug.hasAuth,
+        headersSent: result.debug.headersSent,
+        requestUrl: result.debug.requestUrl?.substring(0, 100),
       });
+      if (result.debug.responseHeaders) {
+        const interesting = Object.entries(result.debug.responseHeaders)
+          .filter(([k]: [string, any]) => /auth|token|session|www-auth|allow|csrf/i.test(k))
+          .map(([k, v]: [string, any]) => `${k}: ${v}`);
+        if (interesting.length > 0) {
+          logger.warn(`  Response headers: ${interesting.join(', ')}`);
+        }
+      }
     }
     throw new Error(`PL24 API ${result.error}: ${apiPath.substring(0, 80)}`);
   }
@@ -217,12 +240,11 @@ async function pl24FetchViaPlaywright(page: Page, apiPath: string): Promise<PL24
   const fullUrl = apiPath.startsWith('http')
     ? apiPath
     : `https://www.partslink24.com${apiPath}`;
-  
+
   try {
     const response = await page.request.get(fullUrl, {
       headers: {
         'Accept': 'application/json, text/plain, */*',
-        'X-Requested-With': 'XMLHttpRequest',
         'Referer': page.url(),
         // Include any captured SPA headers
         ...Object.fromEntries(
@@ -241,6 +263,48 @@ async function pl24FetchViaPlaywright(page: Page, apiPath: string): Promise<PL24
   } catch (err: any) {
     throw new Error(`PL24 Playwright API: ${err.message?.substring(0, 100)}`);
   }
+}
+
+/**
+ * Fetch BOM data by navigating within the SPA and intercepting the API response.
+ * Uses the MAIN page's authenticated SPA context — no new tab needed.
+ * The SPA's own HTTP client handles auth, and we intercept the response.
+ */
+async function fetchBomViaSpaRoute(
+  page: Page, bomApiPath: string, serviceName: string
+): Promise<PL24Response> {
+  // Encode BOM path as SPA route payload (same format the SPA uses internally)
+  const payload = Buffer.from(JSON.stringify({
+    path: bomApiPath, wid: 'bomListTable', auto: true
+  })).toString('base64');
+  const bomSpaPath = `/pl24-app/${serviceName}/0/${encodeURIComponent(payload)}/`;
+
+  // Set up response interception BEFORE triggering navigation
+  const responsePromise = page.waitForResponse(
+    resp => {
+      const u = resp.url();
+      return (u.includes('/p5vwag/extern/bom/') || u.includes('/extern/bom/')) &&
+             resp.request().resourceType() !== 'document';
+    },
+    { timeout: 15000 }
+  );
+
+  // Trigger SPA internal navigation via History API + popstate
+  await page.evaluate(`
+    (() => {
+      window.history.pushState({}, '', ${JSON.stringify(bomSpaPath)});
+      window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+    })()
+  `);
+
+  const response = await responsePromise;
+
+  if (!response.ok()) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`SPA-route BOM ${response.status()}: ${body.substring(0, 100)}`);
+  }
+
+  return await response.json() as PL24Response;
 }
 
 /**
@@ -379,11 +443,98 @@ export async function crawlBrandViaApi(brand: string): Promise<{
       throw new Error('SPA loaded in demo mode — session transfer failed');
     }
 
+    // Step 2.5: Extract auth tokens from all browser storage locations
+    const storageInfo = await page.evaluate(`
+      (() => {
+        const info = { ls: {}, ss: {}, cookies: document.cookie, idb: [] };
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          info.ls[k] = localStorage.getItem(k)?.substring(0, 200);
+        }
+        for (let i = 0; i < sessionStorage.length; i++) {
+          const k = sessionStorage.key(i);
+          info.ss[k] = sessionStorage.getItem(k)?.substring(0, 200);
+        }
+        // Check if window.fetch was patched by the SPA
+        info.fetchPatched = window.fetch.toString().indexOf('[native code]') === -1;
+        return info;
+      })()
+    `) as any;
+
+    logger.info(`⚡ Browser storage scan:`);
+    logger.info(`  Cookies: ${storageInfo.cookies?.substring(0, 150)}`);
+    logger.info(`  localStorage keys: ${Object.keys(storageInfo.ls).join(', ') || '(empty)'}`);
+    logger.info(`  sessionStorage keys: ${Object.keys(storageInfo.ss).join(', ') || '(empty)'}`);
+    logger.info(`  fetch patched by SPA: ${storageInfo.fetchPatched}`);
+
+    // Look for auth tokens in storage
+    for (const [store, data] of [['localStorage', storageInfo.ls], ['sessionStorage', storageInfo.ss]] as const) {
+      for (const [key, val] of Object.entries(data as Record<string, string>)) {
+        if (/auth|token|bearer|jwt|session/i.test(key) || /eyJ[A-Za-z0-9_-]{10,}/.test(val || '')) {
+          logger.info(`  ⚡ Potential auth in ${store}["${key}"]: ${(val || '').substring(0, 100)}`);
+          // If it looks like a JWT, use it
+          const jwtMatch = (val || '').match(/(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/);
+          if (jwtMatch && !capturedSpaHeaders['authorization']) {
+            capturedSpaHeaders['authorization'] = `Bearer ${jwtMatch[1]}`;
+            logger.info(`  ⚡ JWT extracted from ${store} → authorization header set`);
+          }
+        }
+      }
+    }
+
+    // Also scan IndexedDB for auth tokens
+    try {
+      const idbTokens = await page.evaluate(`
+        (async () => {
+          try {
+            const dbs = await indexedDB.databases();
+            const tokens = [];
+            for (const dbInfo of dbs) {
+              try {
+                const db = await new Promise((resolve, reject) => {
+                  const req = indexedDB.open(dbInfo.name);
+                  req.onsuccess = () => resolve(req.result);
+                  req.onerror = () => reject(req.error);
+                });
+                const storeNames = Array.from(db.objectStoreNames);
+                tokens.push({ db: dbInfo.name, stores: storeNames });
+                for (const storeName of storeNames) {
+                  if (/auth|token|session/i.test(storeName)) {
+                    try {
+                      const tx = db.transaction(storeName, 'readonly');
+                      const store = tx.objectStore(storeName);
+                      const all = await new Promise((resolve, reject) => {
+                        const req = store.getAll();
+                        req.onsuccess = () => resolve(req.result);
+                        req.onerror = () => reject(req.error);
+                      });
+                      tokens.push({ db: dbInfo.name, store: storeName, data: JSON.stringify(all).substring(0, 300) });
+                    } catch {}
+                  }
+                }
+                db.close();
+              } catch {}
+            }
+            return tokens;
+          } catch { return []; }
+        })()
+      `) as any[];
+      if (idbTokens?.length > 0) {
+        logger.info(`  ⚡ IndexedDB: ${JSON.stringify(idbTokens).substring(0, 300)}`);
+      }
+    } catch {}
+
     // Step 3: Fetch model list via API
     const upds = '2026-03-27--00-02'; // PL24 update timestamp
     const modelsResp = await pl24Fetch(page,
       `/p5vwag/extern/vehicle/modelfamilies?lang=de&localMarketOnly=true&serviceName=${serviceName}&upds=${upds}`
     );
+
+    // ⚠️ Check if API returned demo mode (subscription expired)
+    if ((modelsResp as any).demo === true) {
+      logger.error('⚠️ PL24 API returned demo=true — Abonnement abgelaufen! Subscription must be renewed.');
+      throw new Error('PL24 subscription expired (demo=true in API response). Renew at partslink24.com');
+    }
 
     // Filter: keep all models with a caption and a link, skip catalog info entries
     const skipNames = ['Sonderkataloge', 'Elektrische Verbind.', 'Chemische Stoffe',
@@ -556,29 +707,35 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                     const bomResp = await pl24Fetch(page, bt.link.path);
                     const parts = bomResp.data?.records || [];
 
-                    const seen = new Set<string>();
-                    for (const part of parts) {
-                      const v = part.values || {};
-                      const partNo = (v.partNo || v.partno || v.partNo || '').trim();
-                      const desc = (v.description || v.caption || v.captions || v.name || '').trim();
-                      if (!partNo) continue;
-                      const stripped = partNo.replace(/[\s.\-]/g, '');
-                      if (stripped.length < 5 || stripped.length > 20) continue;
-                      if (seen.has(stripped)) continue;
-                      seen.add(stripped);
-                      oems.push({ oem: partNo, description: desc });
-                    }
+                    // Check if BOM response says demo mode
+                    if ((bomResp as any).demo === true) {
+                      logger.warn(`      ⚠ BOM returned demo=true — subscription issue`);
+                      bomApiFailed = true;
+                    } else {
+                      const seen = new Set<string>();
+                      for (const part of parts) {
+                        const v = part.values || {};
+                        const partNo = (v.partNo || v.partno || '').trim();
+                        const desc = (v.description || v.caption || v.captions || v.name || '').trim();
+                        if (!partNo) continue;
+                        const stripped = partNo.replace(/[\s.\-]/g, '');
+                        if (stripped.length < 5 || stripped.length > 20) continue;
+                        if (seen.has(stripped)) continue;
+                        seen.add(stripped);
+                        oems.push({ oem: partNo, description: desc });
+                      }
 
-                    if (parts.length > 0 && oems.length === 0) {
-                      const firstPartKeys = Object.keys(parts[0].values || {});
-                      logger.info(`      ○ BT ${btIllus}: ${parts.length} records, 0 OEMs (keys: ${firstPartKeys.join(', ')})`);
+                      if (parts.length > 0 && oems.length === 0) {
+                        const firstPartKeys = Object.keys(parts[0].values || {});
+                        logger.info(`      ○ BT ${btIllus}: ${parts.length} records, 0 OEMs (keys: ${firstPartKeys.join(', ')})`);
+                      }
                     }
                   } catch (apiErr: any) {
                     if (apiErr.message?.includes('403')) {
                       if (!bomApiFailed) {
                         logger.warn(`      ⚠ BOM API (fetch) returns 403 — trying Playwright API...`);
                       }
-                      
+
                       // ── Strategy 1.5: Playwright-level request (Node.js, different networking path) ──
                       try {
                         const bomResp = await pl24FetchViaPlaywright(page, bt.link!.path);
@@ -603,7 +760,6 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                       } catch (pwErr: any) {
                         if (!bomApiFailed) {
                           logger.warn(`      ⚠ Playwright API also failed: ${pwErr.message?.substring(0, 60)}`);
-                          logger.warn(`      ⚠ Switching to SPA navigation mode`);
                           bomApiFailed = true;
                         }
                       }
@@ -613,45 +769,50 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                   }
                 }
 
-                // ── Strategy 2: SPA navigation in NEW TAB + DOM extraction ──
-                // IMPORTANT: Use a new tab to avoid destroying the main page's SPA session.
-                // page.goto() on the main page kills the SPA's in-memory auth state → demo mode.
+                // ── Strategy 2: SPA in-page navigation + response interception ──
+                // Instead of opening a new tab (which goes to demo mode), navigate
+                // WITHIN the main page's SPA using pushState + popstate.
+                // The SPA's own HTTP client handles auth properly.
                 if (bomApiFailed && oems.length === 0) {
-                  let bomTab: Page | null = null;
                   try {
-                    // Construct SPA URL for this specific BOM page
-                    const bomPayload = Buffer.from(JSON.stringify({
-                      path: bt.link!.path, wid: 'bomListTable', auto: true
-                    })).toString('base64');
-                    const bomSpaUrl = `https://www.partslink24.com/pl24-app/${serviceName}/0/${encodeURIComponent(bomPayload)}/`;
+                    logger.info(`      ⚡ Trying SPA route navigation for BT ${btIllus}...`);
+                    const bomResp = await fetchBomViaSpaRoute(page, bt.link!.path, serviceName);
+                    const parts = bomResp.data?.records || [];
 
-                    // Open in a new tab (shares cookies with the main page's browser context)
-                    bomTab = await page.context().newPage();
-                    await bomTab.goto(bomSpaUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                    // Wait for SPA to render value spans
-                    await bomTab.waitForSelector('[class*="_value_"] span', { timeout: 8000 }).catch(() => {});
-                    await sleep(1500);
-
-                    // Check if page is in demo mode
-                    const currentUrl = bomTab.url();
-                    if (currentUrl.includes('/demo')) {
-                      if (btIdx < 3) {
-                        logger.warn(`      ⚠ New tab loaded in demo mode — session cookies insufficient`);
-                      }
-                    } else {
-                      // Extract OEMs from the rendered BOM page
-                      oems = await extractOemsFromDom(bomTab);
+                    const seen = new Set<string>();
+                    for (const part of parts) {
+                      const v = part.values || {};
+                      const partNo = (v.partNo || v.partno || '').trim();
+                      const desc = (v.description || v.caption || v.captions || v.name || '').trim();
+                      if (!partNo) continue;
+                      const stripped = partNo.replace(/[\s.\-]/g, '');
+                      if (stripped.length < 5 || stripped.length > 20) continue;
+                      if (seen.has(stripped)) continue;
+                      seen.add(stripped);
+                      oems.push({ oem: partNo, description: desc });
                     }
 
-                    if (oems.length === 0 && btIdx < 3) {
-                      const spanCount = await bomTab.evaluate(`document.querySelectorAll('[class*="_value_"] span').length`) as any as number;
-                      logger.info(`      ○ BT ${btIllus}: 0 OEMs from DOM (${spanCount} spans, url=${currentUrl.substring(0, 70)})`);
+                    if (oems.length > 0) {
+                      logger.info(`      ⚡ SPA route worked! ${oems.length} OEMs`);
                     }
                   } catch (spaErr: any) {
-                    logger.warn(`      ⚠ SPA fallback failed for BT ${btIllus}: ${spaErr.message?.substring(0, 80)}`);
-                  } finally {
-                    // Always close the tab to avoid resource leaks
-                    if (bomTab) await bomTab.close().catch(() => {});
+                    logger.warn(`      ⚠ SPA route failed: ${spaErr.message?.substring(0, 80)}`);
+
+                    // ── Strategy 3: DOM extraction as last resort ──
+                    try {
+                      // Wait for SPA to render (it may have partially navigated)
+                      await page.waitForSelector('[class*="_value_"] span', { timeout: 5000 }).catch(() => {});
+                      await sleep(1000);
+                      const currentUrl = page.url();
+                      if (!currentUrl.includes('/demo')) {
+                        oems = await extractOemsFromDom(page);
+                        if (oems.length > 0) {
+                          logger.info(`      ⚡ DOM extraction worked! ${oems.length} OEMs`);
+                        }
+                      }
+                    } catch (domErr: any) {
+                      logger.warn(`      ⚠ DOM extraction also failed: ${domErr.message?.substring(0, 60)}`);
+                    }
                   }
                 }
 
