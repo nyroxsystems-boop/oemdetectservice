@@ -98,22 +98,39 @@ let capturedSpaHeaders: Record<string, string> = {};
 /**
  * Set up a network interceptor to capture headers from PL24's own API requests.
  * Must be called BEFORE clicking the brand link so we catch the SPA's initial data load.
+ *
+ * Keeps listening until we have an authorization header — the first SPA request
+ * may not carry the Bearer token (e.g. if the SPA bootstraps before auth completes).
  */
 function setupHeaderCapture(page: Page): void {
   capturedSpaHeaders = {};
-  
+
   page.on('request', (request) => {
-    // Only capture headers from PL24 API requests made by the SPA itself
     const url = request.url();
     if (url.includes('/p5vwag/extern/') && request.resourceType() === 'fetch') {
+      const headers = request.headers();
+
+      // Always grab the full set on first capture
       if (Object.keys(capturedSpaHeaders).length === 0) {
-        const headers = request.headers();
-        // Capture all non-standard headers (skip trivially common ones)
         for (const [key, value] of Object.entries(headers)) {
           capturedSpaHeaders[key.toLowerCase()] = value;
         }
         logger.info(`⚡ Captured ${Object.keys(capturedSpaHeaders).length} SPA headers`);
-        // Log interesting headers for debugging
+      }
+
+      // Keep updating auth-related headers from subsequent requests until we have one
+      const auth = headers['authorization'] || headers['Authorization'];
+      if (auth && !capturedSpaHeaders['authorization']) {
+        capturedSpaHeaders['authorization'] = auth;
+        logger.info(`⚡ Auth header captured from later request: ${auth.substring(0, 40)}...`);
+      }
+      const xsrf = headers['x-xsrf-token'] || headers['X-XSRF-TOKEN'];
+      if (xsrf && !capturedSpaHeaders['x-xsrf-token']) {
+        capturedSpaHeaders['x-xsrf-token'] = xsrf;
+      }
+
+      // Log interesting headers
+      if (auth || Object.keys(capturedSpaHeaders).length <= 10) {
         const interesting = Object.entries(capturedSpaHeaders)
           .filter(([k]) => k.startsWith('x-') || k === 'authorization' || k.includes('csrf') || k.includes('token'))
           .map(([k, v]) => `${k}: ${v.substring(0, 30)}`);
@@ -341,6 +358,18 @@ export async function crawlBrandViaApi(brand: string): Promise<{
       logger.warn('⚡ SPA URL not detected after brand click');
     }
     await sleep(3000);
+
+    // Wait for SPA to make at least one authenticated API call (captures Bearer token)
+    // The SPA bootstraps async — auth headers may arrive after the initial page load
+    if (!capturedSpaHeaders['authorization']) {
+      logger.info('⚡ Waiting for SPA to fire authenticated API call...');
+      for (let i = 0; i < 10 && !capturedSpaHeaders['authorization']; i++) {
+        await sleep(1000);
+      }
+      if (!capturedSpaHeaders['authorization']) {
+        logger.warn('⚡ No authorization header captured after 10s — BOM API will likely 403');
+      }
+    }
 
     const spaUrl = page.url();
     const isDemo = spaUrl.includes('/demo');
