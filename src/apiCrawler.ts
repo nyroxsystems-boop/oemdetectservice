@@ -529,14 +529,15 @@ export async function crawlBrandViaApi(brand: string): Promise<{
 
                     const seen = new Set<string>();
                     for (const part of parts) {
-                      const partNo = (part.values?.partNo || part.values?.['partNo'] || '').trim();
-                      const caption = (part.values?.caption || part.values?.['captions'] || part.values?.['name'] || '').trim();
+                      const v = part.values || {};
+                      const partNo = (v.partNo || v.partno || v.partNo || '').trim();
+                      const desc = (v.description || v.caption || v.captions || v.name || '').trim();
                       if (!partNo) continue;
                       const stripped = partNo.replace(/[\s.\-]/g, '');
                       if (stripped.length < 5 || stripped.length > 20) continue;
                       if (seen.has(stripped)) continue;
                       seen.add(stripped);
-                      oems.push({ oem: partNo, description: caption });
+                      oems.push({ oem: partNo, description: desc });
                     }
 
                     if (parts.length > 0 && oems.length === 0) {
@@ -556,14 +557,15 @@ export async function crawlBrandViaApi(brand: string): Promise<{
 
                         const seen = new Set<string>();
                         for (const part of parts) {
-                          const partNo = (part.values?.partNo || part.values?.['partNo'] || '').trim();
-                          const caption = (part.values?.caption || part.values?.['captions'] || part.values?.['name'] || '').trim();
+                          const v = part.values || {};
+                          const partNo = (v.partNo || v.partno || '').trim();
+                          const desc = (v.description || v.caption || v.captions || v.name || '').trim();
                           if (!partNo) continue;
                           const stripped = partNo.replace(/[\s.\-]/g, '');
                           if (stripped.length < 5 || stripped.length > 20) continue;
                           if (seen.has(stripped)) continue;
                           seen.add(stripped);
-                          oems.push({ oem: partNo, description: caption });
+                          oems.push({ oem: partNo, description: desc });
                         }
 
                         if (oems.length > 0) {
