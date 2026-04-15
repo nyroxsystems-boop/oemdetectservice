@@ -223,9 +223,9 @@ async function runChain(): Promise<void> {
         // Do NOT break — continue with the next brand
       }
 
-      // Small breather between brands so crawlers fully release their pages
+      // Breather between brands — let rate limits cool down fully
       if (!state.cancelled && i < state.brands.length - 1) {
-        await sleep(500);
+        await sleep(5000);
       }
     }
   } finally {

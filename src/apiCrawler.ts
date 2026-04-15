@@ -86,6 +86,61 @@ interface PL24Response {
   debug?: any;
 }
 
+// ── Adaptive Rate Limiting ───────────────────────────────────────────────────
+
+/** Delay between BOM requests — starts at 500ms, increases on 429 */
+let bomRequestDelay = 500;
+
+// ── Dynamic Service Name Discovery ──────────────────────────────────────────
+
+const discoveredServiceNames: Record<string, string> = {};
+
+/**
+ * Discover actual PL24 service names from the dashboard HTML.
+ * The dashboard has links like: <a href="/partslink24/launchCatalog.do?service=bmw&t=...">
+ * This handles cases where PL24_SERVICE_MAP has incorrect entries (e.g. BMW, Mercedes, Ford).
+ */
+async function discoverServiceNames(page: Page): Promise<Record<string, string>> {
+  if (Object.keys(discoveredServiceNames).length > 0) return discoveredServiceNames;
+
+  try {
+    const links = await page.evaluate(`
+      (() => {
+        const results = {};
+        const anchors = document.querySelectorAll('a[href*="launchCatalog"]');
+        for (const a of anchors) {
+          const href = a.getAttribute('href') || '';
+          const match = href.match(/service=([^&]+)/);
+          if (match) {
+            const serviceName = match[1];
+            const img = a.querySelector('img');
+            const alt = img ? (img.getAttribute('alt') || '').trim() : '';
+            const title = (a.getAttribute('title') || '').trim();
+            const text = (a.textContent || '').trim();
+            const brandLabel = alt || title || text;
+            if (brandLabel && serviceName) {
+              results[brandLabel.toUpperCase().trim()] = serviceName;
+            }
+          }
+        }
+        return results;
+      })()
+    `) as Record<string, string>;
+
+    Object.assign(discoveredServiceNames, links);
+    logger.info('⚡ Discovered service names from dashboard:');
+    for (const [brand, svc] of Object.entries(links)) {
+      const staticName = PL24_SERVICE_MAP[brand];
+      const marker = staticName && staticName !== svc ? ` ⚠️ (static map had "${staticName}")` : '';
+      logger.info(`   ${brand} → ${svc}${marker}`);
+    }
+  } catch (err: any) {
+    logger.warn(`⚡ Service name discovery failed: ${err.message}`);
+  }
+
+  return discoveredServiceNames;
+}
+
 // ── API Helper ───────────────────────────────────────────────────────────────
 
 /**
@@ -147,88 +202,106 @@ function setupHeaderCapture(page: Page): void {
  * Injects any captured auth headers from the SPA's own requests.
  */
 async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
-  // Pass captured auth headers from Node.js into the browser context
-  const capturedAuth = capturedSpaHeaders['authorization'] || '';
-  const capturedXsrf = capturedSpaHeaders['x-xsrf-token'] || '';
+  const maxRetries = 3;
 
-  const result = await page.evaluate(`
-    (async function() {
-      try {
-        const headers = {
-          'Accept': 'application/json, text/plain, */*',
-        };
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Pass captured auth headers from Node.js into the browser context
+    const capturedAuth = capturedSpaHeaders['authorization'] || '';
+    const capturedXsrf = capturedSpaHeaders['x-xsrf-token'] || '';
 
-        // Inject captured auth headers from SPA (passed from Node.js)
-        const capturedAuth = ${JSON.stringify(capturedAuth)};
-        if (capturedAuth) {
-          headers['Authorization'] = capturedAuth;
-        }
-
-        // XSRF-TOKEN: try captured header first, then cookie
-        const capturedXsrf = ${JSON.stringify(capturedXsrf)};
-        if (capturedXsrf) {
-          headers['X-XSRF-TOKEN'] = capturedXsrf;
-        } else {
-          const xsrf = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
-          if (xsrf) headers['X-XSRF-TOKEN'] = decodeURIComponent(xsrf[1]);
-        }
-
-        const r = await fetch(${JSON.stringify(apiPath)}, {
-          credentials: 'include',
-          headers,
-        });
-        if (!r.ok) {
-          // Capture response body — the error message tells us WHY
-          let responseBody = '';
-          try { responseBody = await r.text(); } catch {}
-          const respHeaders = {};
-          r.headers.forEach((v, k) => { respHeaders[k] = v; });
-          return {
-            error: r.status,
-            statusText: r.statusText,
-            data: { records: [] },
-            debug: {
-              responseBody: responseBody.substring(0, 500),
-              responseHeaders: respHeaders,
-              requestUrl: ${JSON.stringify(apiPath)},
-              cookies: document.cookie.substring(0, 500),
-              url: window.location.href,
-              hasAuth: !!capturedAuth,
-              headersSent: Object.keys(headers).join(', '),
-            },
+    const result = await page.evaluate(`
+      (async function() {
+        try {
+          const headers = {
+            'Accept': 'application/json, text/plain, */*',
           };
-        }
-        return await r.json();
-      } catch(e) {
-        return { error: e.message, data: { records: [] } };
-      }
-    })()
-  `) as any;
 
-  if (result.error) {
-    // Log comprehensive debug info for 403 errors
-    if (result.debug) {
-      logger.warn(`PL24 API ${result.error} [${result.statusText}] debug:`, {
-        responseBody: result.debug.responseBody?.substring(0, 200),
-        cookies: result.debug.cookies?.substring(0, 150),
-        pageUrl: result.debug.url?.substring(0, 80),
-        hasAuth: result.debug.hasAuth,
-        headersSent: result.debug.headersSent,
-        requestUrl: result.debug.requestUrl?.substring(0, 100),
-      });
-      if (result.debug.responseHeaders) {
-        const interesting = Object.entries(result.debug.responseHeaders)
-          .filter(([k]: [string, any]) => /auth|token|session|www-auth|allow|csrf/i.test(k))
-          .map(([k, v]: [string, any]) => `${k}: ${v}`);
-        if (interesting.length > 0) {
-          logger.warn(`  Response headers: ${interesting.join(', ')}`);
+          // Inject captured auth headers from SPA (passed from Node.js)
+          const capturedAuth = ${JSON.stringify(capturedAuth)};
+          if (capturedAuth) {
+            headers['Authorization'] = capturedAuth;
+          }
+
+          // XSRF-TOKEN: try captured header first, then cookie
+          const capturedXsrf = ${JSON.stringify(capturedXsrf)};
+          if (capturedXsrf) {
+            headers['X-XSRF-TOKEN'] = capturedXsrf;
+          } else {
+            const xsrf = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+            if (xsrf) headers['X-XSRF-TOKEN'] = decodeURIComponent(xsrf[1]);
+          }
+
+          const r = await fetch(${JSON.stringify(apiPath)}, {
+            credentials: 'include',
+            headers,
+          });
+          if (!r.ok) {
+            // Capture response body — the error message tells us WHY
+            let responseBody = '';
+            try { responseBody = await r.text(); } catch {}
+            const respHeaders = {};
+            r.headers.forEach((v, k) => { respHeaders[k] = v; });
+            return {
+              error: r.status,
+              statusText: r.statusText,
+              data: { records: [] },
+              debug: {
+                responseBody: responseBody.substring(0, 500),
+                responseHeaders: respHeaders,
+                requestUrl: ${JSON.stringify(apiPath)},
+                cookies: document.cookie.substring(0, 500),
+                url: window.location.href,
+                hasAuth: !!capturedAuth,
+                headersSent: Object.keys(headers).join(', '),
+              },
+            };
+          }
+          return await r.json();
+        } catch(e) {
+          return { error: e.message, data: { records: [] } };
+        }
+      })()
+    `) as any;
+
+    if (result.error) {
+      // ── 429 Too Many Requests — retry with exponential backoff ──
+      if (result.error === 429 && attempt < maxRetries) {
+        const backoffSec = 30 * Math.pow(2, attempt); // 30s, 60s, 120s
+        logger.warn(`⚡ 429 Rate Limited — waiting ${backoffSec}s before retry (${attempt + 1}/${maxRetries})...`);
+        // Also increase the adaptive BOM delay to reduce future 429s
+        bomRequestDelay = Math.min(bomRequestDelay * 2, 5000);
+        logger.info(`⚡ Adaptive BOM delay increased to ${bomRequestDelay}ms`);
+        await sleep(backoffSec * 1000);
+        continue;
+      }
+
+      // Log comprehensive debug info for errors
+      if (result.debug) {
+        logger.warn(`PL24 API ${result.error} [${result.statusText}] debug:`, {
+          responseBody: result.debug.responseBody?.substring(0, 200),
+          cookies: result.debug.cookies?.substring(0, 150),
+          pageUrl: result.debug.url?.substring(0, 80),
+          hasAuth: result.debug.hasAuth,
+          headersSent: result.debug.headersSent,
+          requestUrl: result.debug.requestUrl?.substring(0, 100),
+        });
+        if (result.debug.responseHeaders) {
+          const interesting = Object.entries(result.debug.responseHeaders)
+            .filter(([k]: [string, any]) => /auth|token|session|www-auth|allow|csrf/i.test(k))
+            .map(([k, v]: [string, any]) => `${k}: ${v}`);
+          if (interesting.length > 0) {
+            logger.warn(`  Response headers: ${interesting.join(', ')}`);
+          }
         }
       }
+      throw new Error(`PL24 API ${result.error}: ${apiPath.substring(0, 80)}`);
     }
-    throw new Error(`PL24 API ${result.error}: ${apiPath.substring(0, 80)}`);
+
+    return result as PL24Response;
   }
 
-  return result as PL24Response;
+  // Should not reach here, but TypeScript needs it
+  throw new Error(`PL24 API: max retries exceeded for ${apiPath.substring(0, 80)}`);
 }
 
 /**
@@ -357,7 +430,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
   brand: string; modelsFound: number; totalOems: number; errors: string[];
 }> {
   const brandUpper = brand.toUpperCase();
-  const serviceName = PL24_SERVICE_MAP[brandUpper];
+  let serviceName = PL24_SERVICE_MAP[brandUpper];
   if (!serviceName) throw new Error(`Unknown brand: ${brand}`);
 
   const ctx = getContext();
@@ -390,6 +463,17 @@ export async function crawlBrandViaApi(brand: string): Promise<{
       if (!loggedIn) throw new Error('Login failed');
     }
     logger.info('⚡ Login OK');
+
+    // Step 1.5: Discover correct service names from dashboard HTML
+    // This handles brands where PL24_SERVICE_MAP has wrong entries (BMW, Mercedes, Ford)
+    const discovered = await discoverServiceNames(page);
+    if (discovered[brandUpper] && discovered[brandUpper] !== serviceName) {
+      logger.info(`⚡ Overriding service name: "${serviceName}" → "${discovered[brandUpper]}" (from dashboard)`);
+      serviceName = discovered[brandUpper];
+    }
+
+    // Reset adaptive delay for each brand
+    bomRequestDelay = 500;
 
     // Step 2: Navigate to brand SPA via the dashboard link (transfers JSP session → SPA)
     // We need to click the actual launchCatalog link from the dashboard to get the session token
@@ -763,8 +847,12 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                           bomApiFailed = true;
                         }
                       }
+                    } else if (apiErr.message?.includes('429')) {
+                      // 429 after all retries in pl24Fetch — skip this BT but don't flag API as permanently failed
+                      logger.warn(`      ⚠ 429 after retries — skipping BT ${btIllus}, cooling down 60s...`);
+                      await sleep(60000);
                     } else {
-                      throw apiErr; // Re-throw non-403 errors
+                      throw apiErr; // Re-throw other errors
                     }
                   }
                 }
@@ -849,13 +937,16 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                 logger.error(`      ❌ BT ${btIllus} error: ${err.message?.substring(0, 100)}`);
               }
 
-              // Delay between requests — more for SPA mode (page navigation), less for API mode
-              await sleep(bomApiFailed ? 300 : 50);
+              // Delay between BOM requests — adaptive (increases on 429), more for SPA fallback
+              await sleep(bomApiFailed ? 500 : bomRequestDelay);
             }
           } catch (err: any) {
             logger.warn(`    ⚡ HG "${hgName}" error: ${err.message}`);
             errors.push(`${modelName}/${hgName}: ${err.message}`);
           }
+
+          // Cooldown between HG groups to avoid triggering rate limits
+          await sleep(2000);
         }
 
         logger.info(`  ⚡ ${modelName}: done (total OEMs: ${totalOems})`);
@@ -865,8 +956,8 @@ export async function crawlBrandViaApi(brand: string): Promise<{
         errors.push(`${modelName}: ${err.message}`);
       }
 
-      // Small delay between models
-      await sleep(200);
+      // Delay between models
+      await sleep(1000);
     }
 
     updateJobStatus(jobId, 'completed', { total_parts_found: totalOems });
