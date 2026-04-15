@@ -13,6 +13,7 @@ import { logger } from './logger';
 import { PL24_SERVICE_MAP } from './scraper';
 import { crawlBrandViaApi, getApiState, pauseApi, resumeApi, cancelApi } from './apiCrawler';
 import { crawlSingleBrand, getBulkState, pauseBulk, resumeBulk, cancelBulk } from './bulkCrawler';
+import { flushExportBuffer } from './bulkStore';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -211,6 +212,9 @@ async function runChain(): Promise<void> {
           state.errors.push({ brand, message: e, at: new Date().toISOString() });
         }
 
+        // Flush buffered exports before moving to next brand
+        flushExportBuffer();
+
         logger.info(`🔗 [Chain] ✅ ${brand} done — ${result.totalOems} OEMs, ${result.modelsFound} models, ${result.errors.length} errors`);
       } catch (err: any) {
         const msg = err?.message || String(err);
@@ -221,10 +225,11 @@ async function runChain(): Promise<void> {
 
       // Small breather between brands so crawlers fully release their pages
       if (!state.cancelled && i < state.brands.length - 1) {
-        await sleep(2000);
+        await sleep(500);
       }
     }
   } finally {
+    flushExportBuffer();
     state.active = false;
     state.currentIndex = state.brands.length;
     state.currentBrand = null;

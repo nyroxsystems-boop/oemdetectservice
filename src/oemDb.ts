@@ -333,7 +333,7 @@ export async function upsertVehicle(data: {
 
 /**
  * Bulk insert scraped OEM results from a bulk crawl job.
- * Called after each Hauptgruppe/Bildtafel batch completes.
+ * Uses multi-row INSERT for speed (1 query instead of N).
  */
 export async function bulkInsertResults(results: Array<{
     oem: string;
@@ -345,34 +345,59 @@ export async function bulkInsertResults(results: Array<{
     year_from?: number | null;
     year_to?: number | null;
     engine?: string | null;
-    [key: string]: unknown; // Allow extra fields (vin, bildtafel, etc.)
+    [key: string]: unknown;
 }>): Promise<number> {
     if (!pool || results.length === 0) return 0;
 
     let inserted = 0;
-    for (const r of results) {
+
+    // Batch oem_numbers: multi-row INSERT with UNNEST
+    try {
+        const oems = results.map(r => r.oem);
+        const brands = results.map(r => r.brand);
+        const categories = results.map(r => r.hg_name || 'other');
+        const descriptions = results.map(r => r.description || null);
+
+        const res = await pool.query(
+            `INSERT INTO oem_numbers (oem_number, brand, part_category, part_description, sources, confidence)
+             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[],
+                ARRAY_FILL('["PartsLink24"]'::jsonb, ARRAY[$5::int]),
+                ARRAY_FILL(0.9::real, ARRAY[$5::int]))
+             ON CONFLICT (oem_number, brand, part_category)
+             DO UPDATE SET hit_count = oem_numbers.hit_count + 1, updated_at = NOW()`,
+            [oems, brands, categories, descriptions, results.length]
+        );
+        inserted = res.rowCount || 0;
+    } catch (err) {
+        logger.warn('[OEM-DB] Bulk insert oem_numbers failed:', err instanceof Error ? err.message : err);
+    }
+
+    // Batch fitments: multi-row INSERT with UNNEST
+    const fitments = results.filter(r => r.model || r.model_code);
+    if (fitments.length > 0) {
         try {
             await pool.query(
-                `INSERT INTO oem_numbers (oem_number, brand, part_category, part_description, sources, confidence)
-                 VALUES ($1, $2, $3, $4, '["PartsLink24"]'::jsonb, 0.9)
-                 ON CONFLICT (oem_number, brand, part_category)
-                 DO UPDATE SET hit_count = oem_numbers.hit_count + 1, updated_at = NOW()`,
-                [r.oem, r.brand, r.hg_name || 'other', r.description || null]
+                `INSERT INTO vehicle_fitments (oem_number, make, model, model_code, year_from, year_to, engine, source)
+                 SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[],
+                    $5::int[], $6::int[], $7::text[],
+                    ARRAY_FILL('PartsLink24'::text, ARRAY[$8::int]))
+                 ON CONFLICT DO NOTHING`,
+                [
+                    fitments.map(r => r.oem),
+                    fitments.map(r => r.brand),
+                    fitments.map(r => r.model || null),
+                    fitments.map(r => r.model_code || null),
+                    fitments.map(r => r.year_from ?? null),
+                    fitments.map(r => r.year_to ?? null),
+                    fitments.map(r => r.engine || null),
+                    fitments.length,
+                ]
             );
-
-            if (r.model || r.model_code) {
-                await pool.query(
-                    `INSERT INTO vehicle_fitments (oem_number, make, model, model_code, year_from, year_to, engine, source)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'PartsLink24')
-                     ON CONFLICT DO NOTHING`,
-                    [r.oem, r.brand, r.model || null, r.model_code || null, r.year_from || null, r.year_to || null, r.engine || null]
-                );
-            }
-            inserted++;
-        } catch {
-            // Skip individual failures
+        } catch (err) {
+            logger.warn('[OEM-DB] Bulk insert fitments failed:', err instanceof Error ? err.message : err);
         }
     }
+
     return inserted;
 }
 

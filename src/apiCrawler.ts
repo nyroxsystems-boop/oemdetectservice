@@ -34,7 +34,7 @@ import {
 } from './scraper';
 import {
   insertResults, incrementJobParts, createJob, updateJobStatus,
-  getJob, upsertVehicle, getBulkStats,
+  getJob, upsertVehicle, getBulkStats, isBtAlreadyScraped,
 } from './bulkStore';
 
 // ── Shared state with bulkCrawler (import the setters) ───────────────────────
@@ -508,6 +508,13 @@ export async function crawlBrandViaApi(brand: string): Promise<{
               const btIllus = (bt.values?.illustrationNumber || '').replace(/\\/g, '');
               const btCaption = (bt.values?.captions || '').split('\n')[0].trim();
               const btSubgroup = bt.values?.subgroup || '';
+              const hgCodeNum = hgName.match(/^(\d)/)?.[1] || '';
+
+              // Smart resume: skip BTs already in the database
+              if (btIllus && isBtAlreadyScraped(brandUpper, modelName, hgCodeNum, btIllus)) {
+                if (btIdx < 3) logger.info(`      [${btIdx + 1}/${bildtafeln.length}] BT ${btIllus} — SKIP (already scraped)`);
+                continue;
+              }
 
               try {
                 logger.info(`      [${btIdx + 1}/${bildtafeln.length}] BT ${btIllus} "${btCaption}" (UG:${btSubgroup})`);
@@ -651,7 +658,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
               }
 
               // Delay between requests — more for SPA mode (page navigation), less for API mode
-              await sleep(bomApiFailed ? 500 : 200);
+              await sleep(bomApiFailed ? 300 : 50);
             }
           } catch (err: any) {
             logger.warn(`    ⚡ HG "${hgName}" error: ${err.message}`);
@@ -667,7 +674,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
       }
 
       // Small delay between models
-      await sleep(500);
+      await sleep(200);
     }
 
     updateJobStatus(jobId, 'completed', { total_parts_found: totalOems });

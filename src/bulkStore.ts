@@ -197,6 +197,7 @@ export function initBulkStore(): void {
   addColumnIfMissing('bulk_results', 'engine', 'TEXT');
   db.exec(`CREATE INDEX IF NOT EXISTS idx_results_model_code ON bulk_results(model_code)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_results_year ON bulk_results(year_from, year_to)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_results_resume ON bulk_results(brand, model, hg_code, bildtafel)`);
 
   const vehicleCount = (db.prepare('SELECT COUNT(*) as c FROM vehicles').get() as any)?.c || 0;
   const resultCount = (db.prepare('SELECT COUNT(*) as c FROM bulk_results').get() as any)?.c || 0;
@@ -493,35 +494,67 @@ export function insertResults(jobId: number, rows: Array<{
   });
   tx();
 
-  // Auto-export to WhatsApp-Bot OEM database (fire-and-forget)
+  // Buffer for batched auto-export to WhatsApp-Bot OEM database
   if (inserted > 0) {
-    autoExportToOemDb(rows).catch(() => { /* silent — don't block scraping */ });
+    enqueueExport(rows);
   }
 
   return inserted;
 }
 
-/** Push OEMs to WhatsApp-Bot OEM database automatically */
-async function autoExportToOemDb(rows: Array<{
+// ── Buffered Auto-Export ─────────────────────────────────────────────────────
+// Instead of POSTing to WhatsApp-Bot after every single BT, buffer rows and
+// flush when we hit EXPORT_BUFFER_SIZE or EXPORT_FLUSH_INTERVAL_MS — whichever
+// comes first. Reduces HTTP overhead from ~500 calls/HG to ~2-3.
+
+const EXPORT_BUFFER_SIZE = 200;
+const EXPORT_FLUSH_INTERVAL_MS = 10_000;
+
+const HG_CATEGORY_MAP: Record<string, string> = {
+  '1': 'engine', '2': 'fuel', '3': 'transmission', '4': 'steering',
+  '5': 'suspension', '6': 'brake', '7': 'clutch', '8': 'body',
+  '9': 'electrical', '0': 'accessories',
+};
+
+type ExportRow = {
   oem: string; brand: string; model: string; description?: string;
   hg_code?: string; hg_name?: string; fg_code?: string; fg_name?: string;
   year_from?: number | null; year_to?: number | null;
   model_code?: string | null; engine?: string | null;
-}>): Promise<void> {
+};
+
+let exportBuffer: ExportRow[] = [];
+let exportTimer: ReturnType<typeof setTimeout> | null = null;
+
+function enqueueExport(rows: ExportRow[]): void {
+  exportBuffer.push(...rows);
+
+  // Start timer on first row if not already running
+  if (!exportTimer) {
+    exportTimer = setTimeout(() => flushExportBuffer(), EXPORT_FLUSH_INTERVAL_MS);
+  }
+
+  // Flush immediately when buffer is full
+  if (exportBuffer.length >= EXPORT_BUFFER_SIZE) {
+    flushExportBuffer();
+  }
+}
+
+/** Force-flush the export buffer (called between brands + at shutdown) */
+export function flushExportBuffer(): void {
+  if (exportTimer) { clearTimeout(exportTimer); exportTimer = null; }
+  if (exportBuffer.length === 0) return;
+
+  const batch = exportBuffer.splice(0);
+  sendExportBatch(batch).catch(() => { /* silent */ });
+}
+
+async function sendExportBatch(rows: ExportRow[]): Promise<void> {
   const { config } = require('./config');
   const wwsUrl = config.wwsBotUrl;
   const token = config.adminToken;
 
-  if (!wwsUrl) {
-    logger.warn('[AutoExport] WWS_BOT_URL not configured — skipping');
-    return;
-  }
-
-  const HG_CATEGORY_MAP: Record<string, string> = {
-    '1': 'engine', '2': 'fuel', '3': 'transmission', '4': 'steering',
-    '5': 'suspension', '6': 'brake', '7': 'clutch', '8': 'body',
-    '9': 'electrical', '0': 'accessories',
-  };
+  if (!wwsUrl) return;
 
   const records = rows.map(r => ({
     oem: r.oem,
@@ -536,9 +569,7 @@ async function autoExportToOemDb(rows: Array<{
   }));
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (token) {
-    headers['Authorization'] = `Token ${token}`;
-  }
+  if (token) headers['Authorization'] = `Token ${token}`;
 
   try {
     const resp = await fetch(`${wwsUrl}/api/service/oem-bulk-import`, {
@@ -551,7 +582,7 @@ async function autoExportToOemDb(rows: Array<{
       logger.error(`[AutoExport] FAILED ${resp.status}: ${errText.substring(0, 200)}`);
     } else {
       const data = await resp.json().catch(() => ({})) as any;
-      logger.info(`[AutoExport] OK: ${data.imported || 0} imported, ${data.skipped || 0} skipped, total=${data.totalRecords || '?'}`);
+      logger.info(`[AutoExport] OK: ${records.length} sent → ${data.imported || 0} imported, ${data.skipped || 0} skipped`);
     }
   } catch (err: any) {
     logger.error(`[AutoExport] Error: ${err.message}`);
@@ -597,6 +628,21 @@ export function getAllResultsForExport(jobIds?: number[]): BulkResultRow[] {
     `SELECT DISTINCT oem, description, brand, model, hg_code, hg_name, fg_code, fg_name, vin
      FROM bulk_results ORDER BY brand, oem`
   ).all() as BulkResultRow[];
+}
+
+// ── Resume: check if a BT was already scraped ──────────────────────────────
+
+/**
+ * Returns true if we already have results for this brand+model+hg+bt combo.
+ * Used by the API crawler to skip already-scraped Bildtafeln on resume.
+ */
+export function isBtAlreadyScraped(brand: string, model: string, hgCode: string, bildtafel: string): boolean {
+  const row = db.prepare(`
+    SELECT 1 FROM bulk_results
+    WHERE brand = ? AND model = ? AND hg_code = ? AND bildtafel = ?
+    LIMIT 1
+  `).get(brand.toUpperCase(), model, hgCode, bildtafel);
+  return !!row;
 }
 
 // ── Global Stats ─────────────────────────────────────────────────────────────
