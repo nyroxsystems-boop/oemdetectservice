@@ -53,6 +53,9 @@ export function cancelApi(): void {
   apiCurrentBrand = null;
   apiAborted = true;
   apiPaused = false;
+  // Close the persistent page so next run starts fresh
+  crawlerPage?.close().catch(() => {});
+  crawlerPage = null;
 }
 
 export function pauseApi(): void {
@@ -86,10 +89,24 @@ interface PL24Response {
   debug?: any;
 }
 
+// ── Persistent Crawler Page ──────────────────────────────────────────────────
+// Reuse a single page across all brands to maintain session (avoids re-login)
+let crawlerPage: Page | null = null;
+
 // ── Adaptive Rate Limiting ───────────────────────────────────────────────────
 
 /** Delay between BOM requests — starts at 500ms, increases on 429 */
 let bomRequestDelay = 500;
+
+// ── SPA Response Interception ───────────────────────────────────────────────
+// Each manufacturer group has its own API base path:
+//   VW AG (VW, Audi, Porsche, Seat, Skoda, Cupra, Bentley): /p5vwag/extern/
+//   BMW Group (BMW, Mini): /p5bmw/extern/
+//   Mercedes-Benz: /p5mb/extern/ (or similar)
+//   Others: discovered dynamically
+let capturedApiBase: string | null = null;
+let capturedModelfamiliesData: PL24Response | null = null;
+let captureGeneration = 0;
 
 // ── Dynamic Service Name Discovery ──────────────────────────────────────────
 
@@ -151,21 +168,35 @@ async function discoverServiceNames(page: Page): Promise<Record<string, string>>
 let capturedSpaHeaders: Record<string, string> = {};
 
 /**
- * Set up a network interceptor to capture headers from PL24's own API requests.
- * Must be called BEFORE clicking the brand link so we catch the SPA's initial data load.
+ * Set up network interceptors to:
+ * 1. Capture headers from PL24's API requests (for reuse in manual fetch calls)
+ * 2. Discover the brand-specific API base path (e.g. /p5bmw/extern/)
+ * 3. Intercept the SPA's own modelfamilies response (avoids auth issues)
  *
- * Captures BOTH fetch and XHR requests — the SPA may use Axios (which uses XHR)
- * rather than the native fetch API.
+ * Must be called BEFORE clicking the brand link so we catch the SPA's initial data load.
+ * Uses a generation counter so old handlers from previous brands are ignored.
  */
 function setupHeaderCapture(page: Page): void {
   capturedSpaHeaders = {};
+  capturedApiBase = null;
+  capturedModelfamiliesData = null;
+  const gen = ++captureGeneration;
 
   page.on('request', (request) => {
+    if (gen !== captureGeneration) return; // Stale handler from previous brand
     const url = request.url();
     const rtype = request.resourceType();
-    // Capture both fetch AND xhr — Axios uses XMLHttpRequest under the hood
-    if (url.includes('/p5vwag/extern/') && (rtype === 'fetch' || rtype === 'xhr')) {
+    // Capture ALL /extern/ API calls — each manufacturer has its own API base
+    // VW AG: /p5vwag/, BMW: /p5bmw/, Mercedes: /p5mb/, etc.
+    if (url.includes('/extern/') && (rtype === 'fetch' || rtype === 'xhr')) {
       const headers = request.headers();
+
+      // Extract API base path from first matching request
+      const baseMatch = url.match(/(\/p5[a-z]+\/extern)/);
+      if (baseMatch && !capturedApiBase) {
+        capturedApiBase = baseMatch[1];
+        logger.info(`⚡ API base discovered: ${capturedApiBase}`);
+      }
 
       // Always grab the full set on first capture
       if (Object.keys(capturedSpaHeaders).length === 0) {
@@ -175,7 +206,7 @@ function setupHeaderCapture(page: Page): void {
         logger.info(`⚡ Captured ${Object.keys(capturedSpaHeaders).length} SPA headers (type: ${rtype})`);
       }
 
-      // Keep updating auth-related headers from ALL subsequent requests
+      // Keep updating auth-related headers
       const auth = headers['authorization'] || headers['Authorization'];
       if (auth) {
         capturedSpaHeaders['authorization'] = auth;
@@ -185,14 +216,19 @@ function setupHeaderCapture(page: Page): void {
       if (xsrf) {
         capturedSpaHeaders['x-xsrf-token'] = xsrf;
       }
+    }
+  });
 
-      // Log interesting headers on first few captures
-      const interesting = Object.entries(headers)
-        .filter(([k]) => k.startsWith('x-') || k === 'authorization' || k.includes('csrf') || k.includes('token') || k.includes('bearer'))
-        .map(([k, v]) => `${k}: ${v.substring(0, 40)}`);
-      if (interesting.length > 0) {
-        logger.info(`⚡ Request headers [${rtype}]: ${interesting.join(', ')}`);
-      }
+  // Intercept the SPA's own modelfamilies response — the SPA handles auth correctly,
+  // so this gives us properly authenticated data without needing to replicate auth
+  page.on('response', async (response) => {
+    if (gen !== captureGeneration) return;
+    const url = response.url();
+    if (url.includes('/extern/vehicle/modelfamilies') && response.ok()) {
+      try {
+        capturedModelfamiliesData = await response.json() as PL24Response;
+        logger.info(`⚡ Intercepted modelfamilies: ${capturedModelfamiliesData.data?.records?.length ?? 0} records`);
+      } catch {}
     }
   });
 }
@@ -439,11 +475,17 @@ export async function crawlBrandViaApi(brand: string): Promise<{
   logger.info(`\n⚡ API CRAWLER: ${brandUpper}`);
   logger.info(`${'═'.repeat(60)}`);
 
-  // Create a page just for login + API calls (no UI interaction needed)
-  const page = await ctx.newPage();
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
+  // Reuse the same page across brands — maintains session, avoids re-login
+  if (!crawlerPage || crawlerPage.isClosed()) {
+    crawlerPage = await ctx.newPage();
+    await crawlerPage.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+    logger.info('⚡ Created new crawler page');
+  } else {
+    logger.info('⚡ Reusing existing crawler page (session maintained)');
+  }
+  const page = crawlerPage;
 
   let totalOems = 0;
   const errors: string[] = [];
@@ -467,9 +509,21 @@ export async function crawlBrandViaApi(brand: string): Promise<{
     // Step 1.5: Discover correct service names from dashboard HTML
     // This handles brands where PL24_SERVICE_MAP has wrong entries (BMW, Mercedes, Ford)
     const discovered = await discoverServiceNames(page);
-    if (discovered[brandUpper] && discovered[brandUpper] !== serviceName) {
-      logger.info(`⚡ Overriding service name: "${serviceName}" → "${discovered[brandUpper]}" (from dashboard)`);
-      serviceName = discovered[brandUpper];
+    // Try exact match first, then fuzzy match (MERCEDES → MERCEDES-BENZ, VW → VOLKSWAGEN)
+    let discoveredName = discovered[brandUpper];
+    if (!discoveredName) {
+      for (const [dbrand, dsvc] of Object.entries(discovered)) {
+        // Match if our brand is a prefix: MERCEDES matches MERCEDES-BENZ
+        if (dbrand.startsWith(brandUpper + '-') || dbrand.startsWith(brandUpper + ' ')) {
+          discoveredName = dsvc;
+          logger.info(`⚡ Fuzzy match: ${brandUpper} → ${dbrand} (${dsvc})`);
+          break;
+        }
+      }
+    }
+    if (discoveredName && discoveredName !== serviceName) {
+      logger.info(`⚡ Overriding service name: "${serviceName}" → "${discoveredName}" (from dashboard)`);
+      serviceName = discoveredName;
     }
 
     // Reset adaptive delay for each brand
@@ -507,16 +561,25 @@ export async function crawlBrandViaApi(brand: string): Promise<{
     }
     await sleep(3000);
 
-    // Wait for SPA to make at least one authenticated API call (captures Bearer token)
-    // The SPA bootstraps async — auth headers may arrive after the initial page load
-    if (!capturedSpaHeaders['authorization']) {
-      logger.info('⚡ Waiting for SPA to fire authenticated API call...');
-      for (let i = 0; i < 10 && !capturedSpaHeaders['authorization']; i++) {
-        await sleep(1000);
+    // Wait for SPA to load and make its modelfamilies API call (we intercept the response)
+    // This is more reliable than making our own call because the SPA handles auth correctly
+    logger.info('⚡ Waiting for SPA modelfamilies response...');
+    for (let i = 0; i < 15 && !capturedModelfamiliesData; i++) {
+      await sleep(1000);
+    }
+
+    if (capturedModelfamiliesData) {
+      logger.info(`⚡ Got intercepted modelfamilies data (${capturedModelfamiliesData.data?.records?.length ?? 0} records)`);
+      if (capturedApiBase) {
+        logger.info(`⚡ API base: ${capturedApiBase}`);
       }
-      if (!capturedSpaHeaders['authorization']) {
-        logger.warn('⚡ No authorization header captured after 10s — BOM API will likely 403');
-      }
+    } else {
+      logger.warn('⚡ No modelfamilies response intercepted after 15s — will try manual API call');
+    }
+
+    // Also capture auth headers if available
+    if (capturedSpaHeaders['authorization']) {
+      logger.info(`⚡ Auth header available: ${capturedSpaHeaders['authorization'].substring(0, 50)}...`);
     }
 
     const spaUrl = page.url();
@@ -527,92 +590,20 @@ export async function crawlBrandViaApi(brand: string): Promise<{
       throw new Error('SPA loaded in demo mode — session transfer failed');
     }
 
-    // Step 2.5: Extract auth tokens from all browser storage locations
-    const storageInfo = await page.evaluate(`
-      (() => {
-        const info = { ls: {}, ss: {}, cookies: document.cookie, idb: [] };
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          info.ls[k] = localStorage.getItem(k)?.substring(0, 200);
-        }
-        for (let i = 0; i < sessionStorage.length; i++) {
-          const k = sessionStorage.key(i);
-          info.ss[k] = sessionStorage.getItem(k)?.substring(0, 200);
-        }
-        // Check if window.fetch was patched by the SPA
-        info.fetchPatched = window.fetch.toString().indexOf('[native code]') === -1;
-        return info;
-      })()
-    `) as any;
-
-    logger.info(`⚡ Browser storage scan:`);
-    logger.info(`  Cookies: ${storageInfo.cookies?.substring(0, 150)}`);
-    logger.info(`  localStorage keys: ${Object.keys(storageInfo.ls).join(', ') || '(empty)'}`);
-    logger.info(`  sessionStorage keys: ${Object.keys(storageInfo.ss).join(', ') || '(empty)'}`);
-    logger.info(`  fetch patched by SPA: ${storageInfo.fetchPatched}`);
-
-    // Look for auth tokens in storage
-    for (const [store, data] of [['localStorage', storageInfo.ls], ['sessionStorage', storageInfo.ss]] as const) {
-      for (const [key, val] of Object.entries(data as Record<string, string>)) {
-        if (/auth|token|bearer|jwt|session/i.test(key) || /eyJ[A-Za-z0-9_-]{10,}/.test(val || '')) {
-          logger.info(`  ⚡ Potential auth in ${store}["${key}"]: ${(val || '').substring(0, 100)}`);
-          // If it looks like a JWT, use it
-          const jwtMatch = (val || '').match(/(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/);
-          if (jwtMatch && !capturedSpaHeaders['authorization']) {
-            capturedSpaHeaders['authorization'] = `Bearer ${jwtMatch[1]}`;
-            logger.info(`  ⚡ JWT extracted from ${store} → authorization header set`);
-          }
-        }
-      }
+    // Step 3: Get model list — prefer intercepted SPA response over manual API call
+    let modelsResp: PL24Response;
+    if (capturedModelfamiliesData) {
+      modelsResp = capturedModelfamiliesData;
+      logger.info(`⚡ Using intercepted modelfamilies data`);
+    } else {
+      // Fallback: manual API call using discovered base path
+      const apiBase = capturedApiBase || '/p5vwag/extern';
+      const upds = '2026-03-27--00-02';
+      logger.info(`⚡ Manual modelfamilies call to ${apiBase}/vehicle/modelfamilies`);
+      modelsResp = await pl24Fetch(page,
+        `${apiBase}/vehicle/modelfamilies?lang=de&localMarketOnly=true&serviceName=${serviceName}&upds=${upds}`
+      );
     }
-
-    // Also scan IndexedDB for auth tokens
-    try {
-      const idbTokens = await page.evaluate(`
-        (async () => {
-          try {
-            const dbs = await indexedDB.databases();
-            const tokens = [];
-            for (const dbInfo of dbs) {
-              try {
-                const db = await new Promise((resolve, reject) => {
-                  const req = indexedDB.open(dbInfo.name);
-                  req.onsuccess = () => resolve(req.result);
-                  req.onerror = () => reject(req.error);
-                });
-                const storeNames = Array.from(db.objectStoreNames);
-                tokens.push({ db: dbInfo.name, stores: storeNames });
-                for (const storeName of storeNames) {
-                  if (/auth|token|session/i.test(storeName)) {
-                    try {
-                      const tx = db.transaction(storeName, 'readonly');
-                      const store = tx.objectStore(storeName);
-                      const all = await new Promise((resolve, reject) => {
-                        const req = store.getAll();
-                        req.onsuccess = () => resolve(req.result);
-                        req.onerror = () => reject(req.error);
-                      });
-                      tokens.push({ db: dbInfo.name, store: storeName, data: JSON.stringify(all).substring(0, 300) });
-                    } catch {}
-                  }
-                }
-                db.close();
-              } catch {}
-            }
-            return tokens;
-          } catch { return []; }
-        })()
-      `) as any[];
-      if (idbTokens?.length > 0) {
-        logger.info(`  ⚡ IndexedDB: ${JSON.stringify(idbTokens).substring(0, 300)}`);
-      }
-    } catch {}
-
-    // Step 3: Fetch model list via API
-    const upds = '2026-03-27--00-02'; // PL24 update timestamp
-    const modelsResp = await pl24Fetch(page,
-      `/p5vwag/extern/vehicle/modelfamilies?lang=de&localMarketOnly=true&serviceName=${serviceName}&upds=${upds}`
-    );
 
     // ⚠️ Check if API returned demo mode (subscription expired)
     if ((modelsResp as any).demo === true) {
@@ -969,7 +960,16 @@ export async function crawlBrandViaApi(brand: string): Promise<{
   } finally {
     apiRunning = false;
     apiCurrentBrand = null;
-    await page.close();
+    // Navigate back to dashboard for the next brand (don't close page — reuse it)
+    try {
+      await page.goto('https://www.partslink24.com/partslink24/user/login.do', {
+        waitUntil: 'domcontentloaded', timeout: 15000,
+      });
+    } catch {
+      // If navigation fails, close page so next brand creates a fresh one
+      crawlerPage?.close().catch(() => {});
+      crawlerPage = null;
+    }
   }
 
   return { brand: brandUpper, modelsFound, totalOems, errors };
