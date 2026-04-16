@@ -85,8 +85,8 @@ interface PL24Response {
   data: { records: PL24Record[] };
   crumbs?: Array<{ name: string }>;
   demo?: boolean;
-  error?: any;
-  debug?: any;
+  error?: number | string;
+  debug?: Record<string, unknown>;
 }
 
 // ── Persistent Crawler Page ──────────────────────────────────────────────────
@@ -151,8 +151,8 @@ async function discoverServiceNames(page: Page): Promise<Record<string, string>>
       const marker = staticName && staticName !== svc ? ` ⚠️ (static map had "${staticName}")` : '';
       logger.info(`   ${brand} → ${svc}${marker}`);
     }
-  } catch (err: any) {
-    logger.warn(`⚡ Service name discovery failed: ${err.message}`);
+  } catch (err: unknown) {
+    logger.warn(`⚡ Service name discovery failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   return discoveredServiceNames;
@@ -297,7 +297,7 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
           return { error: e.message, data: { records: [] } };
         }
       })()
-    `) as any;
+    `) as PL24Response;
 
     if (result.error) {
       // ── 429 Too Many Requests — retry with exponential backoff ──
@@ -323,8 +323,8 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
         });
         if (result.debug.responseHeaders) {
           const interesting = Object.entries(result.debug.responseHeaders)
-            .filter(([k]: [string, any]) => /auth|token|session|www-auth|allow|csrf/i.test(k))
-            .map(([k, v]: [string, any]) => `${k}: ${v}`);
+            .filter(([k]: [string, unknown]) => /auth|token|session|www-auth|allow|csrf/i.test(k))
+            .map(([k, v]: [string, unknown]) => `${k}: ${v}`);
           if (interesting.length > 0) {
             logger.warn(`  Response headers: ${interesting.join(', ')}`);
           }
@@ -369,8 +369,8 @@ async function pl24FetchViaPlaywright(page: Page, apiPath: string): Promise<PL24
     }
 
     return await response.json() as PL24Response;
-  } catch (err: any) {
-    throw new Error(`PL24 Playwright API: ${err.message?.substring(0, 100)}`);
+  } catch (err: unknown) {
+    throw new Error(`PL24 Playwright API: ${err instanceof Error ? err.message.substring(0, 100) : String(err)}`);
   }
 }
 
@@ -457,7 +457,7 @@ async function extractOemsFromDom(page: Page): Promise<Array<{ oem: string; desc
       }
       return results;
     })()
-  `) as any as Array<{ oem: string; description: string }>;
+  `) as Array<{ oem: string; description: string }>;
 }
 
 // ── Main Entry Point ─────────────────────────────────────────────────────────
@@ -543,7 +543,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
         if (links.length > 0) { links[0].click(); return true; }
         return false;
       })()
-    `) as any as boolean;
+    `) as boolean;
 
     if (!brandLinkClicked) {
       // Fallback: navigate directly
@@ -606,7 +606,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
     }
 
     // ⚠️ Check if API returned demo mode (subscription expired)
-    if ((modelsResp as any).demo === true) {
+    if (modelsResp.demo === true) {
       logger.error('⚠️ PL24 API returned demo=true — Abonnement abgelaufen! Subscription must be renewed.');
       throw new Error('PL24 subscription expired (demo=true in API response). Renew at partslink24.com');
     }
@@ -783,7 +783,7 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                     const parts = bomResp.data?.records || [];
 
                     // Check if BOM response says demo mode
-                    if ((bomResp as any).demo === true) {
+                    if (bomResp.demo === true) {
                       logger.warn(`      ⚠ BOM returned demo=true — subscription issue`);
                       bomApiFailed = true;
                     } else {
@@ -805,8 +805,9 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                         logger.info(`      ○ BT ${btIllus}: ${parts.length} records, 0 OEMs (keys: ${firstPartKeys.join(', ')})`);
                       }
                     }
-                  } catch (apiErr: any) {
-                    if (apiErr.message?.includes('403')) {
+                  } catch (apiErr: unknown) {
+                    const apiErrMsg = apiErr instanceof Error ? apiErr.message : String(apiErr);
+                    if (apiErrMsg.includes('403')) {
                       if (!bomApiFailed) {
                         logger.warn(`      ⚠ BOM API (fetch) returns 403 — trying Playwright API...`);
                       }
@@ -832,13 +833,13 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                         if (oems.length > 0) {
                           logger.info(`      ⚡ Playwright API worked! ${oems.length} OEMs`);
                         }
-                      } catch (pwErr: any) {
+                      } catch (pwErr: unknown) {
                         if (!bomApiFailed) {
-                          logger.warn(`      ⚠ Playwright API also failed: ${pwErr.message?.substring(0, 60)}`);
+                          logger.warn(`      ⚠ Playwright API also failed: ${pwErr instanceof Error ? pwErr.message.substring(0, 60) : String(pwErr)}`);
                           bomApiFailed = true;
                         }
                       }
-                    } else if (apiErr.message?.includes('429')) {
+                    } else if (apiErrMsg.includes('429')) {
                       // 429 after all retries in pl24Fetch — skip this BT but don't flag API as permanently failed
                       logger.warn(`      ⚠ 429 after retries — skipping BT ${btIllus}, cooling down 60s...`);
                       await sleep(60000);
@@ -874,8 +875,8 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                     if (oems.length > 0) {
                       logger.info(`      ⚡ SPA route worked! ${oems.length} OEMs`);
                     }
-                  } catch (spaErr: any) {
-                    logger.warn(`      ⚠ SPA route failed: ${spaErr.message?.substring(0, 80)}`);
+                  } catch (spaErr: unknown) {
+                    logger.warn(`      ⚠ SPA route failed: ${spaErr instanceof Error ? spaErr.message.substring(0, 80) : String(spaErr)}`);
 
                     // ── Strategy 3: DOM extraction as last resort ──
                     try {
@@ -889,8 +890,8 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                           logger.info(`      ⚡ DOM extraction worked! ${oems.length} OEMs`);
                         }
                       }
-                    } catch (domErr: any) {
-                      logger.warn(`      ⚠ DOM extraction also failed: ${domErr.message?.substring(0, 60)}`);
+                    } catch (domErr: unknown) {
+                      logger.warn(`      ⚠ DOM extraction also failed: ${domErr instanceof Error ? domErr.message.substring(0, 60) : String(domErr)}`);
                     }
                   }
                 }
@@ -924,16 +925,17 @@ export async function crawlBrandViaApi(brand: string): Promise<{
                     logger.info(`         ${oems[0].oem} — ${oems[0].description?.substring(0, 40)} ... +${oems.length - 1} more`);
                   }
                 }
-              } catch (err: any) {
-                logger.error(`      ❌ BT ${btIllus} error: ${err.message?.substring(0, 100)}`);
+              } catch (err: unknown) {
+                logger.error(`      ❌ BT ${btIllus} error: ${err instanceof Error ? err.message.substring(0, 100) : String(err)}`);
               }
 
               // Delay between BOM requests — adaptive (increases on 429), more for SPA fallback
               await sleep(bomApiFailed ? 500 : bomRequestDelay);
             }
-          } catch (err: any) {
-            logger.warn(`    ⚡ HG "${hgName}" error: ${err.message}`);
-            errors.push(`${modelName}/${hgName}: ${err.message}`);
+          } catch (err: unknown) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            logger.warn(`    ⚡ HG "${hgName}" error: ${errMsg}`);
+            errors.push(`${modelName}/${hgName}: ${errMsg}`);
           }
 
           // Cooldown between HG groups to avoid triggering rate limits
@@ -942,9 +944,10 @@ export async function crawlBrandViaApi(brand: string): Promise<{
 
         logger.info(`  ⚡ ${modelName}: done (total OEMs: ${totalOems})`);
 
-      } catch (err: any) {
-        logger.warn(`  ⚡ ${modelName} error: ${err.message}`);
-        errors.push(`${modelName}: ${err.message}`);
+      } catch (err: unknown) {
+        const modelErrMsg = err instanceof Error ? err.message : String(err);
+        logger.warn(`  ⚡ ${modelName} error: ${modelErrMsg}`);
+        errors.push(`${modelName}: ${modelErrMsg}`);
       }
 
       // Delay between models

@@ -63,7 +63,7 @@ export function initCache(): void {
     db.exec('ALTER TABLE lookups ADD COLUMN result_count INTEGER NOT NULL DEFAULT 0');
   } catch { /* column already exists */ }
 
-  const count = (db.prepare('SELECT COUNT(*) as c FROM lookups').get() as any)?.c || 0;
+  const count = (db.prepare('SELECT COUNT(*) as c FROM lookups').get() as { c: number } | undefined)?.c || 0;
   logger.info(`Cache initialized — ${count} cached lookups`, { path: DB_PATH });
 
   // Run initial cleanup
@@ -86,7 +86,7 @@ export function getCached(vin: string, partQuery: string): CachedResult | null {
     WHERE vin = ? AND part_query = ?
     ORDER BY created_at DESC
     LIMIT 1
-  `).get(vin.toUpperCase(), partQuery.toLowerCase()) as any;
+  `).get(vin.toUpperCase(), partQuery.toLowerCase()) as { vin: string; part_query: string; results_json: string; created_at: string } | undefined;
 
   if (!row) return null;
 
@@ -149,7 +149,7 @@ export function getCacheStats(): {
       MAX(created_at) as newest,
       SUM(result_count) as totalResults
     FROM lookups
-  `).get() as any;
+  `).get() as { total: number; oldest: string | null; newest: string | null; totalResults: number } | undefined;
 
   return {
     totalEntries: stats?.total || 0,

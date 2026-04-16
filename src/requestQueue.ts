@@ -12,7 +12,7 @@ import { logger } from './logger';
 interface QueueItem<T> {
   fn: () => Promise<T>;
   resolve: (value: T) => void;
-  reject: (reason: any) => void;
+  reject: (reason: unknown) => void;
   label: string;
   addedAt: number;
   priority: 'high' | 'low';
@@ -82,7 +82,7 @@ export function resetCircuitBreaker(): void {
 
 // ── Queue ────────────────────────────────────────────────────────────────────
 
-const queue: QueueItem<any>[] = [];
+const queue: QueueItem<unknown>[] = [];
 let isProcessing = false;
 
 /**
@@ -141,9 +141,9 @@ async function processNext(): Promise<void> {
     recordSuccess();
     item.resolve(result);
 
-  } catch (err: any) {
+  } catch (err: unknown) {
     recordFailure();
-    logger.error(`✗ Job failed: "${item.label}"`, { error: err.message });
+    logger.error(`✗ Job failed: "${item.label}"`, { error: err instanceof Error ? err.message : String(err) });
     item.reject(err);
 
   } finally {

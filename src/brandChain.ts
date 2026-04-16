@@ -216,7 +216,7 @@ async function runChain(): Promise<void> {
         flushExportBuffer();
 
         logger.info(`🔗 [Chain] ✅ ${brand} done — ${result.totalOems} OEMs, ${result.modelsFound} models, ${result.errors.length} errors`);
-      } catch (err: any) {
+      } catch (err: unknown) {
         const msg = err?.message || String(err);
         state.errors.push({ brand, message: msg, at: new Date().toISOString() });
         logger.error(`🔗 [Chain] ❌ ${brand} failed: ${msg}`);

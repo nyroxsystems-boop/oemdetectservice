@@ -114,21 +114,22 @@ app.post('/api/lookup', async (req: Request<{}, {}, LookupBody>, res: Response) 
       screenshots: result.screenshots,
     });
 
-  } catch (err: any) {
-    logger.error('Lookup failed', { vin: normalizedVin, part: normalizedPart, error: err.message });
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error('Lookup failed', { vin: normalizedVin, part: normalizedPart, error: errMsg });
 
     // Check if it's a circuit breaker error
-    if (err.message?.includes('Circuit breaker')) {
+    if (errMsg.includes('Circuit breaker')) {
       return res.status(503).json({
         success: false,
-        error: err.message,
+        error: errMsg,
         hint: 'POST /api/circuit-breaker/reset to manually reset',
       });
     }
 
     return res.status(500).json({
       success: false,
-      error: err.message,
+      error: errMsg,
     });
   }
 });
@@ -244,8 +245,8 @@ app.post('/api/bulk/vehicles', (req: Request, res: Response) => {
   try {
     const id = upsertVehicle({ vin, brand, model, model_code, year_from, year_to, notes });
     res.json({ success: true, id });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
@@ -265,8 +266,8 @@ app.post('/api/bulk/discover', async (_req: Request, res: Response) => {
       success: true,
       ...result,
     });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
@@ -293,19 +294,19 @@ app.post('/api/bulk/crawl-brand', async (req: Request, res: Response) => {
       // ⚡ API mode — 10-20x faster, direct REST API calls
       crawlBrandViaApi(brand).then(result => {
         logger.info(`🏁 API crawl complete: ${brand}`, result);
-      }).catch(err => {
-        logger.error(`❌ API crawl failed: ${brand}`, { error: err.message });
+      }).catch((err: unknown) => {
+        logger.error(`❌ API crawl failed: ${brand}`, { error: err instanceof Error ? err.message : String(err) });
       });
     } else {
       // 🌐 Browser mode — original Playwright UI scraping
       crawlSingleBrand(brand).then(result => {
         logger.info(`🏁 Browser crawl complete: ${brand}`, result);
-      }).catch(err => {
-        logger.error(`❌ Browser crawl failed: ${brand}`, { error: err.message });
+      }).catch((err: unknown) => {
+        logger.error(`❌ Browser crawl failed: ${brand}`, { error: err instanceof Error ? err.message : String(err) });
       });
     }
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
@@ -337,8 +338,8 @@ app.post('/api/bulk/chain/start', async (req: Request, res: Response) => {
     const st = getChainState();
     logger.info(`🔗 Chain started via API: ${startBrand} (mode: ${st.mode}, queue: ${st.brands.length})`);
     return res.json({ success: true, state: st });
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message });
+  } catch (err: unknown) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
@@ -369,8 +370,8 @@ app.post('/api/bulk/vehicles/seed', (_req: Request, res: Response) => {
       ...result,
       availableVins: getVinCount(),
     });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
@@ -392,12 +393,12 @@ app.post('/api/bulk/jobs/start', async (req: Request, res: Response) => {
 
   try {
     const job = createJob(vehicleId);
-    startCrawl(job.id).catch(err => {
-      logger.error('Crawl failed', { jobId: job.id, error: err.message });
+    startCrawl(job.id).catch((err: unknown) => {
+      logger.error('Crawl failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
     });
     res.json({ success: true, jobId: job.id });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
@@ -421,12 +422,12 @@ app.post('/api/bulk/jobs/start-all', async (_req: Request, res: Response) => {
         logger.info(`\n🏭 ═══ STARTING BRAND: ${brand} ═══`);
         const result = await crawlSingleBrand(brand);
         logger.info(`✅ Brand ${brand} done: ${result.totalOems} OEMs, ${result.errors.length} errors`);
-      } catch (err: any) {
-        logger.error(`❌ Brand ${brand} failed: ${err.message}`);
+      } catch (err: unknown) {
+        logger.error(`❌ Brand ${brand} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     logger.info('🏁 All brands complete!');
-  })().catch(err => logger.error('Start-all failed', { error: err.message }));
+  })().catch((err: unknown) => logger.error('Start-all failed', { error: err instanceof Error ? err.message : String(err) }));
 });
 
 app.post('/api/bulk/jobs/:id/pause', (req: Request, res: Response) => {
@@ -445,8 +446,8 @@ app.post('/api/bulk/jobs/:id/resume', async (req: Request, res: Response) => {
   if (job.status !== 'paused') return res.status(400).json({ error: 'Job is not paused' });
 
   resumeBulk();
-  startCrawl(id).catch(err => {
-    logger.error('Resume crawl failed', { jobId: id, error: err.message });
+  startCrawl(id).catch((err: unknown) => {
+    logger.error('Resume crawl failed', { jobId: id, error: err instanceof Error ? err.message : String(err) });
   });
   res.json({ success: true });
 });
@@ -559,15 +560,15 @@ app.post('/api/bulk/export', async (req: Request, res: Response) => {
         });
 
         if (resp.ok) {
-          const data = await resp.json() as any;
+          const data = await resp.json() as { imported?: number };
           exported += data.imported || batch.length;
         } else {
           errors += batch.length;
           logger.error(`Export batch failed: ${resp.status}`, { batch: i / batchSize });
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         errors += batch.length;
-        logger.error('Export batch error', { error: err.message });
+        logger.error('Export batch error', { error: err instanceof Error ? err.message : String(err) });
       }
     }
 
@@ -577,8 +578,8 @@ app.post('/api/bulk/export', async (req: Request, res: Response) => {
       exported,
       errors,
     });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 

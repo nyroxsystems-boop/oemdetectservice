@@ -243,8 +243,8 @@ async function login(page: Page): Promise<boolean> {
         })()
       `);
       logger.info('Overlays force-removed via JS');
-    } catch (err: any) {
-      logger.warn('Overlay removal failed — continuing', { error: err.message });
+    } catch (err: unknown) {
+      logger.warn('Overlay removal failed — continuing', { error: err instanceof Error ? err.message : String(err) });
     }
 
     // Wait for page to stabilize after overlay removal
@@ -326,7 +326,7 @@ async function login(page: Page): Promise<boolean> {
 
     // Verify field values via JS (debug)
     try {
-      const fieldValues: any = await page.evaluate(`
+      const fieldValues = await page.evaluate(`
         (() => {
           const texts = Array.from(document.querySelectorAll('input[type="text"]'))
             .filter(i => i.offsetParent !== null)
@@ -507,8 +507,8 @@ async function login(page: Page): Promise<boolean> {
 
     return false;
 
-  } catch (err: any) {
-    logger.error('Login failed with error', { error: err.message });
+  } catch (err: unknown) {
+    logger.error('Login failed with error', { error: err instanceof Error ? err.message : String(err) });
     await takeScreenshot(page, 'login-error');
     return false;
   }
@@ -923,8 +923,8 @@ export async function navigateToVehicle(page: Page, vin: string, brand?: string)
 
     return catalogFound;
 
-  } catch (err: any) {
-    logger.error('Navigate to vehicle failed', { vin, error: err.message });
+  } catch (err: unknown) {
+    logger.error('Navigate to vehicle failed', { vin, error: err instanceof Error ? err.message : String(err) });
     await takeScreenshot(page, 'vin-error');
     return false;
   }
@@ -995,8 +995,8 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
 
     return results;
 
-  } catch (err: any) {
-    logger.error('Part search failed', { partQuery, error: err.message });
+  } catch (err: unknown) {
+    logger.error('Part search failed', { partQuery, error: err instanceof Error ? err.message : String(err) });
     await takeScreenshot(page, 'search-error');
     return [];
   }
@@ -1140,8 +1140,8 @@ async function extractOemResults(page: Page): Promise<OemResult[]> {
     logger.info(`Extracted ${results.length} raw → ${deduped.length} unique results`);
     return deduped;
 
-  } catch (err: any) {
-    logger.error('Result extraction failed', { error: err.message });
+  } catch (err: unknown) {
+    logger.error('Result extraction failed', { error: err instanceof Error ? err.message : String(err) });
     return [];
   }
 }
@@ -1319,17 +1319,17 @@ async function lookupOemInternal(req: LookupRequest): Promise<LookupResponse> {
         screenshots,
       };
 
-    } catch (err: any) {
+    } catch (err: unknown) {
       retries++;
       logger.warn(`Lookup attempt ${retries}/${MAX_RETRIES + 1} failed`, {
-        vin, partQuery, error: err.message,
+        vin, partQuery, error: err instanceof Error ? err.message : String(err),
       });
 
       if (retries > MAX_RETRIES) {
         return {
           success: false, vin, partQuery, results: [],
           fromCache: false, elapsedMs: Date.now() - start,
-          error: `All ${MAX_RETRIES + 1} attempts failed: ${err.message}`,
+          error: `All ${MAX_RETRIES + 1} attempts failed: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
 

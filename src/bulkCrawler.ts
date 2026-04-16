@@ -69,7 +69,7 @@ async function readValueSpans(page: Page): Promise<string[]> {
       }
       return values;
     })()
-  `) as any as string[];
+  `) as string[];
 }
 
 /** Click a _value_ span AND its parent row. Returns if click succeeded. */
@@ -100,7 +100,7 @@ async function clickValueRow(page: Page, text: string): Promise<boolean> {
       }
       return false;
     })()
-  `) as any;
+  `) as boolean;
 
   if (clicked) {
     await waitForStable(page);
@@ -237,7 +237,7 @@ async function extractOemsFromPage(page: Page): Promise<Array<{ oem: string; des
       }
       return results;
     })()
-  `) as any as Array<{ oem: string; description: string }>;
+  `) as Array<{ oem: string; description: string }>;
 }
 
 /** Navigate back using breadcrumb or browser back */
@@ -255,7 +255,7 @@ async function goBack(page: Page, label: string): Promise<boolean> {
       }
       return false;
     })()
-  `) as any;
+  `) as boolean;
 
   if (crumbClicked) {
     logger.info(`  ← Breadcrumb back (${label})`);
@@ -302,7 +302,7 @@ export async function discoverBrandsAndModels(): Promise<{
       if (!loggedIn) throw new Error('Login failed');
       logger.info('🔑 [Discover] Login OK');
       break;
-    } catch (err: any) {
+    } catch (err: unknown) {
       retries++;
       if (page) { try { await page.close(); } catch {} page = null; }
       if (retries > 2) throw new Error(`Login failed after 3 attempts`);
@@ -357,9 +357,10 @@ export async function discoverBrandsAndModels(): Promise<{
           logger.info(`  ⚠ ${brandKey}: No models found (0 value spans or all filtered out)`);
         }
 
-      } catch (err: any) {
-        logger.error(`  ❌ ${brandKey}: ${err.message}`);
-        errors.push(`${brandKey}: ${err.message}`);
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logger.error(`  ❌ ${brandKey}: ${errMsg}`);
+        errors.push(`${brandKey}: ${errMsg}`);
       }
 
       await sleep(config.bulkDelayMs);
@@ -716,10 +717,11 @@ export async function crawlSingleBrand(brand: string): Promise<{
 
                     consecutiveErrors = 0;
                     currentBackoffMs = config.bulkDelayMs;
-                  } catch (err: any) {
+                  } catch (err: unknown) {
                     consecutiveErrors++;
-                    logger.error(`    │ ❌ BT ${bt.bt}: ${err.message}`);
-                    errors.push(`${model}/HG${hg.code}/BT${bt.bt}: ${err.message}`);
+                    const btErrMsg = err instanceof Error ? err.message : String(err);
+                    logger.error(`    │ ❌ BT ${bt.bt}: ${btErrMsg}`);
+                    errors.push(`${model}/HG${hg.code}/BT${bt.bt}: ${btErrMsg}`);
                     currentBackoffMs = Math.min(currentBackoffMs * 2, MAX_BACKOFF_MS);
                     if (consecutiveErrors >= config.bulkMaxConsecutiveErrors) {
                       logger.error(`    │ 🛑 ${consecutiveErrors} consecutive errors — pausing`);
@@ -806,10 +808,11 @@ export async function crawlSingleBrand(brand: string): Promise<{
 
                     consecutiveErrors = 0;
                     currentBackoffMs = config.bulkDelayMs;
-                  } catch (err: any) {
+                  } catch (err: unknown) {
                     consecutiveErrors++;
-                    logger.error(`    │ ❌ UG ${ug.code}: ${err.message}`);
-                    errors.push(`${model}/HG${hg.code}/UG${ug.code}: ${err.message}`);
+                    const ugErrMsg = err instanceof Error ? err.message : String(err);
+                    logger.error(`    │ ❌ UG ${ug.code}: ${ugErrMsg}`);
+                    errors.push(`${model}/HG${hg.code}/UG${ug.code}: ${ugErrMsg}`);
                     currentBackoffMs = Math.min(currentBackoffMs * 2, MAX_BACKOFF_MS);
                     if (consecutiveErrors >= config.bulkMaxConsecutiveErrors) {
                       bulkPaused = true;
@@ -846,17 +849,19 @@ export async function crawlSingleBrand(brand: string): Promise<{
 
             logger.info(`    └── HG ${hg.code} done`);
 
-          } catch (err: any) {
-            logger.error(`    └── ❌ HG ${hg.code}: ${err.message}`);
-            errors.push(`${model}/HG${hg.code}: ${err.message}`);
+          } catch (err: unknown) {
+            const hgErrMsg = err instanceof Error ? err.message : String(err);
+            logger.error(`    └── ❌ HG ${hg.code}: ${hgErrMsg}`);
+            errors.push(`${model}/HG${hg.code}: ${hgErrMsg}`);
           }
         }
 
         logger.info(`  📊 Model "${model}" complete — ${totalOems} OEMs total so far`);
 
-      } catch (err: any) {
-        logger.error(`  ❌ Model "${model}": ${err.message}`);
-        errors.push(`${model}: ${err.message}`);
+      } catch (err: unknown) {
+        const modelErrMsg = err instanceof Error ? err.message : String(err);
+        logger.error(`  ❌ Model "${model}": ${modelErrMsg}`);
+        errors.push(`${model}: ${modelErrMsg}`);
       }
 
       await sleep(config.bulkDelayMs);
@@ -940,7 +945,7 @@ export async function startCrawl(jobId: number): Promise<void> {
       total_parts_found: result.totalOems,
       last_error: result.errors.length > 0 ? result.errors[result.errors.length - 1] : undefined,
     });
-  } catch (err: any) {
-    updateJobStatus(jobId, 'failed', { last_error: err.message });
+  } catch (err: unknown) {
+    updateJobStatus(jobId, 'failed', { last_error: err instanceof Error ? err.message : String(err) });
   }
 }

@@ -81,7 +81,7 @@ async function main() {
       if (cleaned > 0) {
         logger.info(`🧹 Periodic cleanup: removed ${cleaned} expired cache entries`);
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       logger.error('Cache cleanup failed', { error: err.message });
     }
   }, 24 * 60 * 60 * 1000);
@@ -99,8 +99,8 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // Catch unhandled errors — don't crash
-process.on('unhandledRejection', (reason: any) => {
-  logger.error('Unhandled rejection', { error: reason?.message || String(reason) });
+process.on('unhandledRejection', (reason: unknown) => {
+  logger.error('Unhandled rejection', { error: reason instanceof Error ? reason.message : String(reason) });
 });
 
 process.on('uncaughtException', (err: Error) => {

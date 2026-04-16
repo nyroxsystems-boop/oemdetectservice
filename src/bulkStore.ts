@@ -199,8 +199,8 @@ export function initBulkStore(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_results_year ON bulk_results(year_from, year_to)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_results_resume ON bulk_results(brand, model, hg_code, bildtafel)`);
 
-  const vehicleCount = (db.prepare('SELECT COUNT(*) as c FROM vehicles').get() as any)?.c || 0;
-  const resultCount = (db.prepare('SELECT COUNT(*) as c FROM bulk_results').get() as any)?.c || 0;
+  const vehicleCount = (db.prepare('SELECT COUNT(*) as c FROM vehicles').get() as { c: number } | undefined)?.c || 0;
+  const resultCount = (db.prepare('SELECT COUNT(*) as c FROM bulk_results').get() as { c: number } | undefined)?.c || 0;
   logger.info(`Bulk store initialized — ${vehicleCount} vehicles, ${resultCount} results`, { path: DB_PATH });
 }
 
@@ -208,7 +208,7 @@ export function initBulkStore(): void {
 
 export function listVehicles(filters?: { brand?: string; active?: boolean }): BulkVehicle[] {
   let sql = 'SELECT * FROM vehicles WHERE 1=1';
-  const params: any[] = [];
+  const params: (string | number)[] = [];
 
   if (filters?.brand) {
     sql += ' AND brand = ?';
@@ -259,7 +259,7 @@ export function updateVehicle(id: number, data: Partial<{
   notes: string; is_active: boolean;
 }>): boolean {
   const sets: string[] = [];
-  const params: any[] = [];
+  const params: (string | number)[] = [];
 
   if (data.vin !== undefined) { sets.push('vin = ?'); params.push(data.vin.toUpperCase().trim()); }
   if (data.brand !== undefined) { sets.push('brand = ?'); params.push(data.brand.toUpperCase().trim()); }
@@ -316,14 +316,14 @@ export function getNextQueuedJob(): BulkJob | null {
 
 export function listJobs(opts?: { status?: string; limit?: number; offset?: number }): { jobs: BulkJob[]; total: number } {
   let whereSql = '1=1';
-  const params: any[] = [];
+  const params: (string | number)[] = [];
 
   if (opts?.status) {
     whereSql += ' AND status = ?';
     params.push(opts.status);
   }
 
-  const total = (db.prepare(`SELECT COUNT(*) as c FROM bulk_jobs WHERE ${whereSql}`).get(...params) as any)?.c || 0;
+  const total = (db.prepare(`SELECT COUNT(*) as c FROM bulk_jobs WHERE ${whereSql}`).get(...params) as { c: number } | undefined)?.c || 0;
 
   const limit = opts?.limit || 50;
   const offset = opts?.offset || 0;
@@ -340,7 +340,7 @@ export function updateJobStatus(id: number, status: string, extra?: {
   last_hg?: string; last_fg?: string; last_bildtafel?: string;
 }): void {
   const sets = ["status = ?", "updated_at = datetime('now')"];
-  const params: any[] = [status];
+  const params: (string | number)[] = [status];
 
   if (status === 'running' && !getJob(id)?.started_at) {
     sets.push("started_at = datetime('now')");
@@ -439,7 +439,7 @@ export function getJobProgress(jobId: number): {
       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
       SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending
     FROM bulk_progress WHERE job_id = ?
-  `).get(jobId) as any;
+  `).get(jobId) as { total: number; completed: number; failed: number; pending: number } | undefined;
 
   const byHg = db.prepare(`
     SELECT
@@ -451,7 +451,7 @@ export function getJobProgress(jobId: number): {
     FROM bulk_progress WHERE job_id = ?
     GROUP BY hg_code, hg_name
     ORDER BY hg_code ASC
-  `).all(jobId) as any[];
+  `).all(jobId) as Array<{ hg_code: string; hg_name: string | null; total: number; completed: number; failed: number; parts_found: number }>;
 
   return {
     total: counts?.total || 0,
@@ -581,11 +581,11 @@ async function sendExportBatch(rows: ExportRow[]): Promise<void> {
       const errText = await resp.text().catch(() => '');
       logger.error(`[AutoExport] FAILED ${resp.status}: ${errText.substring(0, 200)}`);
     } else {
-      const data = await resp.json().catch(() => ({})) as any;
+      const data = await resp.json().catch(() => ({})) as { imported?: number; skipped?: number };
       logger.info(`[AutoExport] OK: ${records.length} sent → ${data.imported || 0} imported, ${data.skipped || 0} skipped`);
     }
-  } catch (err: any) {
-    logger.error(`[AutoExport] Error: ${err.message}`);
+  } catch (err: unknown) {
+    logger.error(`[AutoExport] Error: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -593,7 +593,7 @@ export function getResults(jobId: number, opts?: {
   limit?: number; offset?: number; search?: string; brand?: string;
 }): { results: BulkResultRow[]; total: number } {
   let whereSql = 'job_id = ?';
-  const params: any[] = [jobId];
+  const params: (string | number)[] = [jobId];
 
   if (opts?.search) {
     whereSql += ' AND (oem LIKE ? OR description LIKE ?)';
@@ -604,7 +604,7 @@ export function getResults(jobId: number, opts?: {
     params.push(opts.brand.toUpperCase());
   }
 
-  const total = (db.prepare(`SELECT COUNT(*) as c FROM bulk_results WHERE ${whereSql}`).get(...params) as any)?.c || 0;
+  const total = (db.prepare(`SELECT COUNT(*) as c FROM bulk_results WHERE ${whereSql}`).get(...params) as { c: number } | undefined)?.c || 0;
 
   const limit = opts?.limit || 50;
   const offset = opts?.offset || 0;
@@ -654,10 +654,10 @@ export function getBulkStats(): {
   totalResults: number;
   resultsByBrand: Array<{ brand: string; count: number }>;
 } {
-  const totalVehicles = (db.prepare('SELECT COUNT(*) as c FROM vehicles').get() as any)?.c || 0;
-  const activeVehicles = (db.prepare('SELECT COUNT(*) as c FROM vehicles WHERE is_active = 1').get() as any)?.c || 0;
-  const totalJobs = (db.prepare('SELECT COUNT(*) as c FROM bulk_jobs').get() as any)?.c || 0;
-  const totalResults = (db.prepare('SELECT COUNT(*) as c FROM bulk_results').get() as any)?.c || 0;
+  const totalVehicles = (db.prepare('SELECT COUNT(*) as c FROM vehicles').get() as { c: number } | undefined)?.c || 0;
+  const activeVehicles = (db.prepare('SELECT COUNT(*) as c FROM vehicles WHERE is_active = 1').get() as { c: number } | undefined)?.c || 0;
+  const totalJobs = (db.prepare('SELECT COUNT(*) as c FROM bulk_jobs').get() as { c: number } | undefined)?.c || 0;
+  const totalResults = (db.prepare('SELECT COUNT(*) as c FROM bulk_results').get() as { c: number } | undefined)?.c || 0;
   const resultsByBrand = db.prepare(
     'SELECT brand, COUNT(DISTINCT oem) as count FROM bulk_results GROUP BY brand ORDER BY count DESC'
   ).all() as Array<{ brand: string; count: number }>;

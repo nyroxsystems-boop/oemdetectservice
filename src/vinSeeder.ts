@@ -272,7 +272,7 @@ export function seedAllVins(): { added: number; skipped: number; total: number }
         year_to: entry.year_to,
       });
       added++;
-    } catch (err: any) {
+    } catch (err: unknown) {
       logger.warn(`[VinSeeder] Failed to seed ${entry.brand} ${entry.model}`, { error: err.message });
       skipped++;
     }
