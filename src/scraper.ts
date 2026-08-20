@@ -39,6 +39,10 @@ import { OemResult } from './cache';
 import { enqueue } from './requestQueue';
 import { SingleSessionGate } from './singleSessionGate';
 import { isPartslinkSessionContinuationLabel } from './partslinkSession';
+import {
+  persistPrivateStorageState,
+  preparePrivateStorageState,
+} from './sessionStateStore';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -75,9 +79,7 @@ async function initBrowserOnce(): Promise<void> {
     browser = null;
   }
 
-  if (!fs.existsSync(STORAGE_DIR)) {
-    fs.mkdirSync(STORAGE_DIR, { recursive: true });
-  }
+  await preparePrivateStorageState(STORAGE_PATH);
 
   logger.info('Launching browser...', { headless: config.headless });
 
@@ -133,7 +135,7 @@ export async function initBrowser(): Promise<void> {
 
 export async function closeBrowser(): Promise<void> {
   if (context) {
-    try { await context.storageState({ path: STORAGE_PATH }); } catch { /* ignore */ }
+    try { await persistPrivateStorageState(context, STORAGE_PATH); } catch { /* ignore */ }
     await context.close();
     context = null;
   }
@@ -535,7 +537,7 @@ async function login(page: Page): Promise<boolean> {
     if (dashboardLoaded) {
       isLoggedIn = true;
       authenticationRejected = false;
-      try { await context!.storageState({ path: STORAGE_PATH }); } catch { /* ignore */ }
+      try { await persistPrivateStorageState(context!, STORAGE_PATH); } catch { /* ignore */ }
       logger.info('✅ Login successful!');
       return true;
     }
@@ -779,14 +781,14 @@ async function probeSharedSession(page: Page): Promise<boolean> {
     if (await verifyLoginSuccess(page)) {
       isLoggedIn = true;
       authenticationRejected = false;
-      try { await context!.storageState({ path: STORAGE_PATH }); } catch { /* ignore */ }
+      try { await persistPrivateStorageState(context!, STORAGE_PATH); } catch { /* ignore */ }
       logger.info('Reusing active PartsLink24 session');
       return true;
     }
     if (await continueCurrentSessionIfOffered(page)) {
       isLoggedIn = true;
       authenticationRejected = false;
-      try { await context!.storageState({ path: STORAGE_PATH }); } catch { /* ignore */ }
+      try { await persistPrivateStorageState(context!, STORAGE_PATH); } catch { /* ignore */ }
       logger.info('Reusing continued PartsLink24 session');
       return true;
     }
