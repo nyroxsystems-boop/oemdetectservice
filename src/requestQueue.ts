@@ -16,6 +16,7 @@ interface QueueItem<T> {
   label: string;
   addedAt: number;
   priority: 'high' | 'low';
+  timeoutMs: number;
 }
 
 export interface QueueStats {
@@ -89,7 +90,12 @@ let isProcessing = false;
  * Add a job to the serialized queue.
  * Only ONE job runs at a time — Playwright is NOT thread-safe.
  */
-export function enqueue<T>(fn: () => Promise<T>, label: string, priority: 'high' | 'low' = 'high'): Promise<T> {
+export function enqueue<T>(
+  fn: () => Promise<T>,
+  label: string,
+  priority: 'high' | 'low' = 'high',
+  timeoutMs: number = JOB_TIMEOUT_MS,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     // Check circuit breaker BEFORE queuing
     if (isCircuitOpen()) {
@@ -103,7 +109,15 @@ export function enqueue<T>(fn: () => Promise<T>, label: string, priority: 'high'
       return;
     }
 
-    queue.push({ fn, resolve, reject, label, addedAt: Date.now(), priority });
+    queue.push({
+      fn,
+      resolve: value => resolve(value as T),
+      reject,
+      label,
+      addedAt: Date.now(),
+      priority,
+      timeoutMs: Math.max(JOB_TIMEOUT_MS, Math.min(timeoutMs, 30 * 60_000)),
+    });
 
     // Sort: high-priority items first, FIFO within same priority
     queue.sort((a, b) => {
@@ -129,24 +143,45 @@ async function processNext(): Promise<void> {
   const waitTime = Date.now() - item.addedAt;
   logger.info(`▶ Processing: "${item.label}" (waited ${waitTime}ms, remaining: ${queue.length})`);
 
+  let timeout: NodeJS.Timeout | null = null;
+  let callerSettled = false;
   try {
-    // Wrap with timeout
+    const timedOut = Symbol('timed-out');
+    const work = item.fn();
     const result = await Promise.race([
-      item.fn(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Job timeout after ${JOB_TIMEOUT_MS / 1000}s`)), JOB_TIMEOUT_MS)
-      ),
+      work,
+      new Promise<typeof timedOut>((resolve) => {
+        timeout = setTimeout(() => resolve(timedOut), item.timeoutMs);
+      }),
     ]);
 
-    recordSuccess();
-    item.resolve(result);
+    if (result === timedOut) {
+      const timeoutError = new Error(`Job timeout after ${item.timeoutMs / 1000}s`);
+      recordFailure();
+      callerSettled = true;
+      item.reject(timeoutError);
+      logger.error(`✗ Job timed out: "${item.label}"; waiting for its browser cleanup before releasing the queue`);
+      // The timeout is a response deadline, not permission to overlap the
+      // single browser session. Keep the queue locked until the old action has
+      // actually returned/closed its page; otherwise the next job races it.
+      await work.catch((lateError: unknown) => {
+        logger.warn(`Timed-out job eventually failed: "${item.label}"`, {
+          error: lateError instanceof Error ? lateError.message : String(lateError),
+        });
+      });
+    } else {
+      recordSuccess();
+      callerSettled = true;
+      item.resolve(result);
+    }
 
   } catch (err: unknown) {
-    recordFailure();
+    if (!callerSettled) recordFailure();
     logger.error(`✗ Job failed: "${item.label}"`, { error: err instanceof Error ? err.message : String(err) });
-    item.reject(err);
+    if (!callerSettled) item.reject(err);
 
   } finally {
+    if (timeout) clearTimeout(timeout);
     isProcessing = false;
     // Process next job (with small delay to prevent CPU spinning)
     if (queue.length > 0) {

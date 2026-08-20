@@ -273,7 +273,9 @@ export function seedAllVins(): { added: number; skipped: number; total: number }
       });
       added++;
     } catch (err: unknown) {
-      logger.warn(`[VinSeeder] Failed to seed ${entry.brand} ${entry.model}`, { error: err.message });
+      logger.warn(`[VinSeeder] Failed to seed ${entry.brand} ${entry.model}`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
       skipped++;
     }
   }

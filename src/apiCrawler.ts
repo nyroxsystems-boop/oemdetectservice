@@ -30,7 +30,7 @@ import { logger } from './logger';
 import { config } from './config';
 import {
   ensureLoggedIn, getContext, PL24_SERVICE_MAP,
-  sleep, humanDelay, resetLoginState,
+  sleep, humanDelay, resetLoginState, runExclusiveBrowserOperation,
 } from './scraper';
 import {
   insertResults, incrementJobParts, createJob, updateJobStatus,
@@ -86,7 +86,16 @@ interface PL24Response {
   crumbs?: Array<{ name: string }>;
   demo?: boolean;
   error?: number | string;
-  debug?: Record<string, unknown>;
+  statusText?: string;
+  debug?: {
+    responseBody?: string;
+    responseHeaders?: Record<string, string>;
+    requestUrl?: string;
+    cookies?: string;
+    url?: string;
+    hasAuth?: boolean;
+    headersSent?: string;
+  };
 }
 
 // ── Persistent Crawler Page ──────────────────────────────────────────────────
@@ -228,7 +237,9 @@ function setupHeaderCapture(page: Page): void {
       try {
         capturedModelfamiliesData = await response.json() as PL24Response;
         logger.info(`⚡ Intercepted modelfamilies: ${capturedModelfamiliesData.data?.records?.length ?? 0} records`);
-      } catch {}
+      } catch (error) {
+        logger.debug(`⚡ Intercepted modelfamilies response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   });
 }
@@ -274,7 +285,7 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
           if (!r.ok) {
             // Capture response body — the error message tells us WHY
             let responseBody = '';
-            try { responseBody = await r.text(); } catch {}
+            try { responseBody = await r.text(); } catch { responseBody = '<response body unreadable>'; }
             const respHeaders = {};
             r.headers.forEach((v, k) => { respHeaders[k] = v; });
             return {
@@ -421,7 +432,7 @@ async function fetchBomViaSpaRoute(
  * Used as fallback when direct API calls return 403.
  */
 async function extractOemsFromDom(page: Page): Promise<Array<{ oem: string; description: string }>> {
-  return page.evaluate(`
+  return await page.evaluate(`
     (() => {
       const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
       const values = [];
@@ -463,6 +474,12 @@ async function extractOemsFromDom(page: Page): Promise<Array<{ oem: string; desc
 // ── Main Entry Point ─────────────────────────────────────────────────────────
 
 export async function crawlBrandViaApi(brand: string): Promise<{
+  brand: string; modelsFound: number; totalOems: number; errors: string[];
+}> {
+  return runExclusiveBrowserOperation(() => crawlBrandViaApiExclusive(brand));
+}
+
+async function crawlBrandViaApiExclusive(brand: string): Promise<{
   brand: string; modelsFound: number; totalOems: number; errors: string[];
 }> {
   const brandUpper = brand.toUpperCase();

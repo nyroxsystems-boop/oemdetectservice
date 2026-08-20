@@ -37,6 +37,8 @@ import { config } from './config';
 import { logger } from './logger';
 import { OemResult } from './cache';
 import { enqueue } from './requestQueue';
+import { SingleSessionGate } from './singleSessionGate';
+import { isPartslinkSessionContinuationLabel } from './partslinkSession';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -50,13 +52,28 @@ const NAVIGATION_TIMEOUT = 30_000;
 let browser: Browser | null = null;
 let context: BrowserContext | null = null;
 let isLoggedIn = false;
+let authenticationRejected = false;
 let lastRequestTime = 0;
 let lastSuccessfulLookup: string | null = null;
+let browserInitPromise: Promise<void> | null = null;
+const sessionGate = new SingleSessionGate();
+const browserOperationGate = new SingleSessionGate();
+
+/** Serialize every operation that uses the shared Partslink account/context.
+ * Login serialization alone is insufficient: separate pages still mutate one
+ * server-side interactive session and may invalidate each other. */
+export function runExclusiveBrowserOperation<T>(operation: () => Promise<T>): Promise<T> {
+  return browserOperationGate.runExclusive(operation);
+}
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
-export async function initBrowser(): Promise<void> {
-  if (browser) return;
+async function initBrowserOnce(): Promise<void> {
+  if (browser && context) return;
+  if (browser && !context) {
+    try { await browser.close(); } catch { /* best effort */ }
+    browser = null;
+  }
 
   if (!fs.existsSync(STORAGE_DIR)) {
     fs.mkdirSync(STORAGE_DIR, { recursive: true });
@@ -102,6 +119,16 @@ export async function initBrowser(): Promise<void> {
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
+}
+
+export async function initBrowser(): Promise<void> {
+  if (browser && context) return;
+  if (!browserInitPromise) {
+    browserInitPromise = initBrowserOnce().finally(() => {
+      browserInitPromise = null;
+    });
+  }
+  await browserInitPromise;
 }
 
 export async function closeBrowser(): Promise<void> {
@@ -208,7 +235,7 @@ async function login(page: Page): Promise<boolean> {
     return false;
   }
 
-  logger.info('Logging in to PartsLink24...', { companyId: config.pl24.companyId, user: config.pl24.username });
+  logger.info('Logging in to PartsLink24...');
 
   try {
     // Navigate to PL24 — does JS redirect from index → startup.do → login page
@@ -300,7 +327,7 @@ async function login(page: Page): Promise<boolean> {
     await humanDelay(50, 100);
     await companyField.type(config.pl24.companyId, { delay: 30 });
     await humanDelay(200, 400);
-    logger.info(`Filled Firmenkennung: "${config.pl24.companyId}"`);
+    logger.info('Filled Firmenkennung');
 
     // Fill Benutzername (2nd text input)
     const userField = textInputs[1];
@@ -310,7 +337,7 @@ async function login(page: Page): Promise<boolean> {
     await humanDelay(50, 100);
     await userField.type(config.pl24.username, { delay: 30 });
     await humanDelay(200, 400);
-    logger.info(`Filled Benutzername: "${config.pl24.username}"`);
+    logger.info('Filled Benutzername');
 
     // Fill Passwort (password input)
     await passField.click({ clickCount: 3 });
@@ -320,23 +347,6 @@ async function login(page: Page): Promise<boolean> {
     await passField.type(config.pl24.password, { delay: 30 });
     await humanDelay(300, 500);
     logger.info('Filled Passwort: ****');
-
-    // Debug: take screenshot BEFORE submitting to verify fields are filled
-    await takeScreenshot(page, 'login-before-submit');
-
-    // Verify field values via JS (debug)
-    try {
-      const fieldValues = await page.evaluate(`
-        (() => {
-          const texts = Array.from(document.querySelectorAll('input[type="text"]'))
-            .filter(i => i.offsetParent !== null)
-            .map(i => ({ value: i.value, name: i.name || i.id || 'unnamed' }));
-          const pass = document.querySelector('input[type="password"]')?.value?.length || 0;
-          return { textFields: texts, passLength: pass };
-        })()
-      `);
-      logger.info(`Field verification: ${JSON.stringify(fieldValues)}`);
-    } catch { /* ignore */ }
 
     // ── Submit login form ──
     // STRATEGY: Use Enter key FIRST (most reliable in real browser sessions),
@@ -352,12 +362,29 @@ async function login(page: Page): Promise<boolean> {
     try {
       await page.waitForURL(url => {
         const u = url.toString().toLowerCase();
-        return !u.includes('login') && !u.includes('startup');
+        return u.includes('brandmenu') || u.includes('dashboard')
+          || u.includes('pl24-app') || u.includes('partslink24/user/');
       }, { timeout: 15000 });
       loginRedirected = true;
       logger.info(`✅ Login redirect detected: ${page.url()}`);
     } catch {
-      logger.info(`Post-login URL (after 15s): ${page.url()}`);
+      // Some PL24 variants replace the page without changing the URL.
+      loginRedirected = await verifyLoginSuccess(page);
+      logger.info(loginRedirected
+        ? 'Dashboard detected without URL change'
+        : `Post-login URL did not reach a dashboard: ${page.url()}`);
+    }
+
+    if (!loginRedirected) {
+      loginRedirected = await continueCurrentSessionIfOffered(page);
+    }
+
+    if (!loginRedirected && await invalidCredentialsVisible(page)) {
+      logger.error('PartsLink24 rejected the configured credentials');
+      authenticationRejected = true;
+      await clearLoginFields(page);
+      await takeScreenshot(page, 'login-failed');
+      return false;
     }
 
     // ONLY if Enter truly didn't work (URL still on login page), try button click
@@ -395,12 +422,28 @@ async function login(page: Page): Promise<boolean> {
       try {
         await page.waitForURL(url => {
           const u = url.toString().toLowerCase();
-          return !u.includes('login') && !u.includes('startup');
+          return u.includes('brandmenu') || u.includes('dashboard')
+            || u.includes('pl24-app') || u.includes('partslink24/user/');
         }, { timeout: 15000 });
         loginRedirected = true;
         logger.info(`✅ Login redirect after button click: ${page.url()}`);
       } catch {
-        logger.warn(`Still on login page after button click: ${page.url()}`);
+        loginRedirected = await verifyLoginSuccess(page);
+        logger.warn(loginRedirected
+          ? 'Dashboard detected after button click without URL change'
+          : `Still on login page after button click: ${page.url()}`);
+      }
+
+      if (!loginRedirected) {
+        loginRedirected = await continueCurrentSessionIfOffered(page);
+      }
+
+      if (!loginRedirected && await invalidCredentialsVisible(page)) {
+        logger.error('PartsLink24 rejected the configured credentials');
+        authenticationRejected = true;
+        await clearLoginFields(page);
+        await takeScreenshot(page, 'login-failed');
+        return false;
       }
     }
 
@@ -425,7 +468,7 @@ async function login(page: Page): Promise<boolean> {
           const u = url.toString().toLowerCase();
           return !u.includes('login') && !u.includes('startup') &&
                  (u.includes('brandmenu') || u.includes('dashboard') ||
-                  u.includes('pl24-app') || u.includes('partslink24.com/partslink24/'));
+                  u.includes('pl24-app') || u.includes('partslink24/user/'));
         }, { timeout: 10000 });
         logger.info(`Dashboard URL detected: ${page.url()}`);
         dashboardLoaded = true;
@@ -491,12 +534,14 @@ async function login(page: Page): Promise<boolean> {
 
     if (dashboardLoaded) {
       isLoggedIn = true;
+      authenticationRejected = false;
       try { await context!.storageState({ path: STORAGE_PATH }); } catch { /* ignore */ }
       logger.info('✅ Login successful!');
       return true;
     }
 
     logger.error('Login failed — dashboard did not load');
+    await clearLoginFields(page);
     await takeScreenshot(page, 'login-failed');
 
     // Debug: dump page content for diagnosis
@@ -509,7 +554,113 @@ async function login(page: Page): Promise<boolean> {
 
   } catch (err: unknown) {
     logger.error('Login failed with error', { error: err instanceof Error ? err.message : String(err) });
+    await clearLoginFields(page);
     await takeScreenshot(page, 'login-error');
+    return false;
+  }
+}
+
+async function clearLoginFields(page: Page): Promise<void> {
+  try {
+    await page.locator('input[type="text"], input[type="password"]').evaluateAll(inputs => {
+      for (const input of inputs) {
+        (input as unknown as { value: string }).value = '';
+      }
+    });
+  } catch {
+    // Best-effort redaction for diagnostic screenshots.
+  }
+}
+
+async function removeCookieOverlay(page: Page): Promise<void> {
+  try {
+    const removed = await page.evaluate<number>(`
+      (() => {
+        let count = 0;
+        const selectors = [
+          '#usercentrics-root',
+          '[data-testid*="uc-"]',
+          '[class*="usercentrics" i]',
+          '[id*="cookie" i][class*="overlay" i]',
+          '[class*="cookie" i][class*="overlay" i]',
+          '[id*="consent" i][class*="overlay" i]',
+          '[class*="consent" i][class*="overlay" i]'
+        ];
+        for (const element of document.querySelectorAll(selectors.join(','))) {
+          element.remove();
+          count += 1;
+        }
+        return count;
+      })()
+    `);
+    if (removed > 0) logger.info(`Removed ${removed} blocking cookie-consent element(s)`);
+  } catch (error) {
+    logger.warn('Could not remove cookie-consent overlay', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function continueCurrentSessionIfOffered(page: Page): Promise<boolean> {
+  // Partslink allows only one browser session per account. With valid
+  // credentials it can therefore show an intermediate takeover screen instead
+  // of the dashboard. Search every frame because deployments have used both a
+  // top-level page and an embedded dialog for this step.
+  const deadline = Date.now() + 7_500;
+
+  while (Date.now() < deadline) {
+    for (const frame of page.frames()) {
+      const candidates = frame.locator(
+        'button, a, input[type="submit"], input[type="button"], [role="button"]',
+      );
+      const count = Math.min(await candidates.count(), 100);
+
+      for (let index = 0; index < count; index += 1) {
+        const candidate = candidates.nth(index);
+        let label = '';
+        try {
+          label = [
+            await candidate.innerText({ timeout: 500 }).catch(() => ''),
+            await candidate.getAttribute('value') ?? '',
+            await candidate.getAttribute('aria-label') ?? '',
+            await candidate.getAttribute('title') ?? '',
+          ].filter(Boolean).join(' ');
+        } catch {
+          continue;
+        }
+
+        if (!isPartslinkSessionContinuationLabel(label)) continue;
+        if (!await candidate.isVisible().catch(() => false)) continue;
+
+        logger.info('PartsLink24 offered the single-session continuation action');
+        await takeScreenshot(page, 'session-continuation-offered');
+        await candidate.click({ timeout: 5_000 });
+        logger.info('Clicked PartsLink24 single-session continuation action');
+
+        try {
+          await page.waitForLoadState('domcontentloaded', { timeout: 15_000 });
+        } catch { /* SPA transitions do not always produce a load event */ }
+        await waitForStable(page);
+
+        const continued = await verifyLoginSuccess(page);
+        logger.info(continued
+          ? 'PartsLink24 session continuation completed successfully'
+          : 'PartsLink24 session continuation did not reach the dashboard');
+        return continued;
+      }
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  return false;
+}
+
+async function invalidCredentialsVisible(page: Page): Promise<boolean> {
+  try {
+    const bodyText = await page.locator('body').innerText({ timeout: 5000 });
+    return /anmeldedaten\s+sind\s+ungültig|invalid\s+credentials|kennwort\s+(?:ist\s+)?falsch/i.test(bodyText);
+  } catch {
     return false;
   }
 }
@@ -585,24 +736,95 @@ async function verifyLoginSuccess(page: Page): Promise<boolean> {
     }
   }
 
+  // The current Partslink portal (/portal-ui) may render only the VIN search
+  // control before any welcome text. Unlike the marketing login page, this is
+  // an actual interactive VIN input and therefore a reliable authenticated
+  // signal.
+  try {
+    const vinSearch = page.locator(
+      'input[placeholder*="Fahrgestell" i], input[data-test-id*="vinSearch" i]',
+    ).first();
+    if (await vinSearch.isVisible({ timeout: 2_000 })) {
+      logger.info('Login verified via authenticated VIN search input');
+      return true;
+    }
+  } catch {
+    // Continue to the diagnostic fallback below.
+  }
+
   logger.warn('Login state unclear — no positive or negative signals matched');
   await takeScreenshot(page, 'login-unclear');
   return false;
 }
 
-export async function ensureLoggedIn(page: Page): Promise<boolean> {
-  if (isLoggedIn) {
+async function probeSharedSession(page: Page): Promise<boolean> {
+  try {
+    await page.goto(config.pl24.baseUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT });
+    await waitForStable(page);
+    await removeCookieOverlay(page);
+    // /portal-ui mounts the authenticated VIN control asynchronously. A quick
+    // body read can otherwise misclassify a valid restored session as a login
+    // failure and start an unnecessary second account session.
     try {
-      await page.goto(config.pl24.baseUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT });
-      await waitForStable(page);
-      if (await verifyLoginSuccess(page)) return true;
-      logger.info('Session expired — re-logging in');
+      await Promise.race([
+        page.locator(
+          'input[placeholder*="Fahrgestell" i], input[data-test-id*="vinSearch" i]',
+        ).first().waitFor({ state: 'visible', timeout: 12_000 }),
+        page.locator('input[type="password"]:visible').first()
+          .waitFor({ state: 'visible', timeout: 12_000 }),
+      ]);
     } catch {
-      logger.info('Session check failed — re-logging in');
+      // verifyLoginSuccess below produces the authoritative diagnostic.
+    }
+    if (await verifyLoginSuccess(page)) {
+      isLoggedIn = true;
+      authenticationRejected = false;
+      try { await context!.storageState({ path: STORAGE_PATH }); } catch { /* ignore */ }
+      logger.info('Reusing active PartsLink24 session');
+      return true;
+    }
+    if (await continueCurrentSessionIfOffered(page)) {
+      isLoggedIn = true;
+      authenticationRejected = false;
+      try { await context!.storageState({ path: STORAGE_PATH }); } catch { /* ignore */ }
+      logger.info('Reusing continued PartsLink24 session');
+      return true;
+    }
+  } catch {
+    logger.info('PartsLink24 session probe failed');
+  }
+  return false;
+}
+
+export async function ensureLoggedIn(page: Page): Promise<boolean> {
+  return sessionGate.runExclusive(async () => {
+    // Always probe the shared context first. This is essential after a process
+    // restart: storageState may already contain the only active PL24 session,
+    // while the in-memory isLoggedIn flag necessarily starts as false.
+    if (await probeSharedSession(page)) return true;
+
+    // An explicit credential rejection is process-latched. This prevents
+    // direct, bulk and QA callers from turning one rejected login into a
+    // sequence of account attempts. A controlled restart permits exactly one
+    // new attempt after credentials or the external PL24 session were fixed.
+    if (authenticationRejected) {
+      logger.warn('PartsLink24 authentication remains blocked after explicit credential rejection');
+      return false;
+    }
+
+    if (isLoggedIn) {
+      logger.info('Stored PartsLink24 session expired — one controlled re-login is required');
     }
     isLoggedIn = false;
-  }
-  return await login(page);
+    try {
+      return await login(page);
+    } catch (error) {
+      logger.warn('Controlled PartsLink24 login failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  });
 }
 
 // ============================================================================
@@ -702,6 +924,7 @@ export async function selectBrand(page: Page, brand: string): Promise<boolean> {
   const upper = brand.toUpperCase();
   const names = BRAND_MAP[upper] || [brand];
   const serviceName = PL24_SERVICE_MAP[upper];
+  await removeCookieOverlay(page);
 
   // Strategy 1: Click launchCatalog link by service name (most reliable)
   // PL24 dashboard uses: <a href="/partslink24/launchCatalog.do?service=audi_parts&t=...">
@@ -761,6 +984,7 @@ export async function navigateToVehicle(page: Page, vin: string, brand?: string)
     // After login, the dashboard shows a text input with placeholder "Fahrgestellnummer"
     // next to a "GO" button. This is NOT inside an iframe — it's in the main DOM.
     await page.waitForTimeout(2000);
+    await removeCookieOverlay(page);
 
     // Log current URL for debugging
     logger.info(`Current URL: ${page.url()}`);
@@ -810,6 +1034,9 @@ export async function navigateToVehicle(page: Page, vin: string, brand?: string)
     }
 
     // ── Step 2: Enter VIN ──
+    // Usercentrics can mount again after the authenticated portal SPA renders,
+    // even when it was already removed on the login page.
+    await removeCookieOverlay(page);
     await vinField.click();
     await humanDelay(200, 400);
     await vinField.fill('');
@@ -847,6 +1074,11 @@ export async function navigateToVehicle(page: Page, vin: string, brand?: string)
       logger.info('GO button not found — submitting via Enter key');
       await vinField.press('Enter');
     }
+
+    // A VIN can be offered by more than one licensed catalog (for example
+    // "Ford" and "Ford Nutzfahrzeuge"). The new portal waits for this choice
+    // instead of navigating immediately.
+    await chooseVinCatalogOption(page, vin, brand);
 
     // ── Step 4: Wait for SPA navigation to catalog ──
     // After clicking GO, PL24 navigates to a React SPA:
@@ -930,6 +1162,57 @@ export async function navigateToVehicle(page: Page, vin: string, brand?: string)
   }
 }
 
+async function chooseVinCatalogOption(page: Page, vin: string, brand?: string): Promise<boolean> {
+  const ambiguityPrompt = page.getByText(
+    /Für diese FIN wurden mehrere Einträge gefunden|multiple entries (?:were )?found/i,
+  ).first();
+
+  try {
+    await ambiguityPrompt.waitFor({ state: 'visible', timeout: 5_000 });
+  } catch {
+    return false;
+  }
+
+  const normalizedBrand = brand?.trim().toUpperCase();
+  const vinMatches = page.getByText(vin, { exact: true });
+  const count = await vinMatches.count();
+  let fallback: Locator | null = null;
+
+  for (let index = 0; index < count; index += 1) {
+    let candidate = vinMatches.nth(index);
+    fallback ??= candidate;
+
+    // Walk only through the small option row. Stop before reaching the popup
+    // container, which includes all alternatives and would make the choice
+    // ambiguous again.
+    for (let depth = 0; depth < 4; depth += 1) {
+      candidate = candidate.locator('xpath=..');
+      const text = (await candidate.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+      if (!text || text.length > 160 || !text.includes(vin)) continue;
+
+      const upper = text.toUpperCase();
+      const isPreferred = !normalizedBrand
+        || (normalizedBrand === 'FORD'
+          ? upper.startsWith('FORD ') && !upper.includes('NUTZFAHRZEUGE')
+          : upper.includes(normalizedBrand));
+
+      if (!isPreferred) continue;
+      logger.info('Selecting VIN catalog option', { brand: brand || 'first available' });
+      await candidate.click({ timeout: 5_000 });
+      return true;
+    }
+  }
+
+  if (fallback) {
+    logger.warn('No exact brand match in VIN catalog choices — selecting the first option', { brand });
+    await fallback.click({ timeout: 5_000 });
+    return true;
+  }
+
+  logger.warn('VIN catalog ambiguity prompt was visible, but no selectable option was found');
+  return false;
+}
+
 // ============================================================================
 // PART SEARCH — "Teile suchen" input in the SPA catalog top bar
 //
@@ -947,10 +1230,67 @@ export async function navigateToVehicle(page: Page, vin: string, brand?: string)
 //   FG           30
 // ============================================================================
 
-async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
+const PART_SEARCH_POSITION_WORDS = new Set([
+  'vorn', 'vorne', 'hinten', 'links', 'rechts', 'linke', 'rechter', 'rechte',
+  'linker', 'oben', 'unten', 'innen', 'aussen', 'außen', 'fahrerseite',
+  'beifahrerseite', 'vorderachse', 'hinterachse', 'va', 'ha', 'vl', 'vr', 'hl', 'hr',
+]);
+
+const PART_SEARCH_ALIASES: Array<[RegExp, string]> = [
+  [/\bpenelst(?:u|ü)tze\b/gi, 'Pendelstütze'],
+  [/\bbremszange\b/gi, 'Bremssattel'],
+  [/\bbremssattelhalter\b|\bbremssatteltr(?:a|ä)ger\b/gi, 'Bremsträger'],
+  [/\bhandbremsseil\b|\bhandbremszug\b|\bfeststellbremsseil\b|\bfeststellbremszug\b|\b(?:bowdenzug|seilzug)\s+feststellbremse\b/gi, 'Handbremsbowdenzug'],
+  [/\bdomlager\b|\bfederbeinlager\b/gi, 'Stützlager'],
+  [/\bstabigummi\b|\bstabilisatorlager\b/gi, 'Gummilager Stabilisator'],
+  [/\bschwenklager\b/gi, 'Achsschenkel'],
+  [/\bspurstangenkopf\b/gi, 'Spurstange'],
+  [/\bt(?:u|ü)rfalle\b/gi, 'Türschloss'],
+  [/\b(?:wa[\s-]?pu|wasserpump)\b/gi, 'Wasserpumpe'],
+  [/\bluftmesser\b/gi, 'Luftmassenmesser'],
+  [/\b(?:lima|lichtmaschine)\b/gi, 'Generator'],
+  [/\b(?:rückleuchte|rueckleuchte|schlussleuchte)\b/gi, 'Heckleuchte'],
+  [/\bfensterheber\s+ohne\s+motor\b/gi, 'Fensterheber'],
+  [/\b(?:fensterhebermotor|elektromotor\s+fensterheber)\b/gi, 'Fensterheberantrieb'],
+  [/\b(?:kraftstoffpumpe\s+im\s+tank|tankpumpe|vorförderpumpe|vorfoerderpumpe)\b/gi, 'Kraftstoffpumpe'],
+  [/\b(?:kraftstoffhochdruckpumpe|hochdruckpumpe|einspritzpumpe)\b/gi, 'Hochdruckpumpe'],
+  [/\b(?:bremsbelag\s*(?:verschleiß|verschleiss)sensor|verschleißsensor\s+bremsbelag|verschleisssensor\s+bremsbelag|warnkontakt\s+bremsbelag)\b/gi, 'Bremsbelagfühler'],
+  [/\b(?:klimakondensator|klimakühler|klimakuehler)\b/gi, 'Kondensator'],
+  [/\bscheibenwischer\b/gi, 'Wischerblatt'],
+];
+
+/**
+ * Partslink's free-text search treats additional words broadly. A query such as
+ * "Koppelstange vorne links" therefore returns arbitrary parts whose names only
+ * contain "vorne links". Search the component family first; axle/side remain
+ * independent result semantics in the comparison layer.
+ */
+export function partslinkSearchQuery(partQuery: string): string {
+  const original = partQuery.normalize('NFKC').replace(/\s+/g, ' ').trim();
+  let aliased = original;
+  for (const [pattern, replacement] of PART_SEARCH_ALIASES) {
+    aliased = aliased.replace(pattern, replacement);
+  }
+  const componentOnly = aliased
+    .split(/[\s,;/()[\]{}]+/)
+    .map(token => token.trim())
+    .filter(Boolean)
+    .filter(token => !PART_SEARCH_POSITION_WORDS.has(token.toLocaleLowerCase('de-DE')))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return componentOnly || original;
+}
+
+async function searchPart(
+  page: Page,
+  partQuery: string,
+  options: { fastAudit?: boolean } = {},
+): Promise<OemResult[]> {
   logger.info('Searching for part...', { partQuery });
 
   try {
+    await removeCookieOverlay(page);
     // ── Find "Teile suchen" input on the SPA page ──
     let searchField = await findSearchInput(page);
 
@@ -958,16 +1298,16 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
       logger.error('"Teile suchen" input not found in catalog SPA!');
       logger.info(`Current URL: ${page.url()}`);
       await takeScreenshot(page, 'search-not-found');
-      return [];
+      throw new Error('PARTSLINK_SEARCH_FIELD_MISSING');
     }
 
     // Click, clear, and type search query
     await searchField.click();
-    await humanDelay(200, 400);
+    await humanDelay(options.fastAudit ? 50 : 200, options.fastAudit ? 100 : 400);
     await searchField.fill('');
-    await humanDelay(100, 200);
-    await searchField.type(partQuery, { delay: 40 });
-    await humanDelay(300, 600);
+    await humanDelay(options.fastAudit ? 25 : 100, options.fastAudit ? 75 : 200);
+    await searchField.type(partQuery, { delay: options.fastAudit ? 15 : 40 });
+    await humanDelay(options.fastAudit ? 100 : 300, options.fastAudit ? 250 : 600);
     logger.info('Search query entered', { partQuery });
 
     // Submit search (Enter key — most reliable in the SPA)
@@ -975,8 +1315,8 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
     logger.info('Search submitted');
 
     // Wait for search results to appear
-    await waitForSearchResults(page, partQuery);
-    await humanDelay(1500, 3000);
+    const resultState = await waitForSearchResults(page, partQuery);
+    await humanDelay(options.fastAudit ? 350 : 1500, options.fastAudit ? 700 : 3000);
 
     // Check for bot detection
     await assertNotBlocked(page, 'part-search');
@@ -988,7 +1328,15 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
     logger.info(`Search URL: ${page.url()}`);
 
     // Extract OEM results from the SPA page
+    if (resultState === 'empty') {
+      logger.info(`Partslink explicitly reported no OEM results for "${partQuery}"`);
+      return [];
+    }
+
     const results = await extractOemResults(page);
+    if (results.length === 0) {
+      throw new Error('PARTSLINK_RESULT_EXTRACTION_EMPTY');
+    }
     logger.info(`Found ${results.length} OEM results for "${partQuery}"`, {
       results: results.slice(0, 5).map(r => `${r.oem} (${r.description})`),
     });
@@ -998,7 +1346,7 @@ async function searchPart(page: Page, partQuery: string): Promise<OemResult[]> {
   } catch (err: unknown) {
     logger.error('Part search failed', { partQuery, error: err instanceof Error ? err.message : String(err) });
     await takeScreenshot(page, 'search-error');
-    return [];
+    throw err;
   }
 }
 
@@ -1070,7 +1418,10 @@ async function findSearchInput(page: Page): Promise<Locator | null> {
  * Real PL24 shows "Suche: ölfilter" header and Bildtafel/Teilenummer blocks
  * in a scrollable drawer panel.
  */
-async function waitForSearchResults(page: Page, query: string): Promise<void> {
+async function waitForSearchResults(
+  page: Page,
+  query: string,
+): Promise<'results' | 'empty'> {
   // Strategy 1: Wait for URL to contain search query parameter
   try {
     await page.waitForURL(/[?&]q=/, { timeout: 15000 });
@@ -1080,25 +1431,39 @@ async function waitForSearchResults(page: Page, query: string): Promise<void> {
   }
 
   // Strategy 2: Wait for result signals in the DOM
-  const signals = [
+  const resultSignals = [
     'text=Teilenummer',                              // Result field label
     'text=Bildtafel',                                // Result field label
     'text=Benennung',                                // Result field label
-    `text=Suche:`,                                   // Search header
-    'text=Es wurden keine Einträge',                 // No results message
   ];
 
-  for (const signal of signals) {
+  for (const signal of resultSignals) {
     try {
       await page.locator(signal).first().waitFor({ state: 'visible', timeout: 10000 });
       logger.info(`Search results loaded — signal: "${signal}"`);
-      return;
+      return 'results';
     } catch { /* try next */ }
   }
 
-  // Fallback: just wait
-  logger.warn('No search result signals detected — waiting 5s');
-  await sleep(5000);
+  const emptySignals = [
+    'text=Es wurden keine Einträge',
+    'text=Keine Einträge gefunden',
+    'text=Keine Ergebnisse gefunden',
+    'text=Keine Treffer',
+  ];
+  for (const signal of emptySignals) {
+    try {
+      await page.locator(signal).first().waitFor({ state: 'visible', timeout: 3000 });
+      logger.info(`Partslink explicitly reported an empty result — signal: "${signal}"`);
+      return 'empty';
+    } catch { /* try next */ }
+  }
+
+  logger.error('No conclusive Partslink result state detected', {
+    query,
+    url: page.url(),
+  });
+  throw new Error('PARTSLINK_RESULT_STATE_UNCONFIRMED');
 }
 
 // ============================================================================
@@ -1142,7 +1507,9 @@ async function extractOemResults(page: Page): Promise<OemResult[]> {
 
   } catch (err: unknown) {
     logger.error('Result extraction failed', { error: err instanceof Error ? err.message : String(err) });
-    return [];
+    throw new Error(
+      `PARTSLINK_RESULT_EXTRACTION_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
@@ -1177,7 +1544,9 @@ export function extractFromText(text: string): OemResult[] {
 
 function parseResultBlock(block: string): OemResult | null {
   const bildMatch = block.match(/Bildtafel\s+(\S+)/i);
-  const oemMatch = block.match(/Teilenummer\s+([A-Z0-9][\sA-Z0-9\-.]{4,25})/i);
+  // Keep the match on one line. `\s` also consumes newlines and previously
+  // appended the following "Benennung" label to otherwise valid OEM numbers.
+  const oemMatch = block.match(/Teilenummer\s+([A-Z0-9][ A-Z0-9\-.]{4,25})/i);
   const descMatch = block.match(/Benennung\s+(.+?)(?:\n|Bildtafel|HG\s|FG\s|$)/i);
   const hgMatch = block.match(/\bHG\s+(\d+)/i);
   const fgMatch = block.match(/\bFG\s+(\d+)/i);
@@ -1202,7 +1571,7 @@ function extractByPattern(text: string): OemResult[] {
   const found = new Set<string>();
 
   const patterns = [
-    /Teilenummer\s+([A-Z0-9][\sA-Z0-9\-.]{6,18})/gi,        // Label-based
+    /Teilenummer\s+([A-Z0-9][ A-Z0-9\-.]{6,18})/gi,         // Value capture stays on one line
     /(\d{2}\s\d{2}\s\d\s\d{3}\s\d{3})/g,                    // BMW: "11 42 7 508 966"
     /([A-Z]\s?\d{3}\s?\d{3}\s?\d{2}\s?\d{2})/g,             // Mercedes: "A 205 421 10 12"
     /([A-Z0-9]{2,3}\s?\d{3}\s?\d{3}\s?[A-Z0-9]{0,2})/g,    // VAG: "5Q0 615 301 F"
@@ -1253,17 +1622,129 @@ export interface LookupResponse {
   screenshots?: string[];
 }
 
+export interface BatchLookupRequest {
+  vin: string;
+  partQueries: string[];
+  brand?: string;
+}
+
 /**
  * Full OEM lookup pipeline — queued for serialized processing.
  */
 export async function lookupOem(req: LookupRequest): Promise<LookupResponse> {
   const label = `VIN=${req.vin} Part="${req.partQuery}" Brand=${req.brand || 'auto'}`;
-  return enqueue(() => lookupOemInternal(req), label);
+  return enqueue(() => runExclusiveBrowserOperation(() => lookupOemInternal(req)), label);
+}
+
+/**
+ * Batch pipeline for QA and catalogue audits.
+ *
+ * Partslink's login and VIN navigation dominate the runtime of a lookup. This
+ * variant opens the vehicle once and performs every search serially inside the
+ * same SPA page and the same authenticated browser session.
+ */
+export async function lookupOemBatch(req: BatchLookupRequest): Promise<LookupResponse[]> {
+  const queries = req.partQueries
+    .map(query => String(query || '').trim())
+    .filter(Boolean);
+  if (!queries.length || queries.length > 250) {
+    throw new Error('PARTSLINK_BATCH_SIZE_INVALID');
+  }
+  const label = `VIN=${req.vin} Batch=${queries.length} Brand=${req.brand || 'auto'}`;
+  const timeoutMs = Math.max(300_000, Math.min(30 * 60_000, queries.length * 15_000));
+  return enqueue(
+    () => runExclusiveBrowserOperation(() => lookupOemBatchInternal({ ...req, partQueries: queries })),
+    label,
+    'low',
+    timeoutMs,
+  );
+}
+
+async function lookupOemBatchInternal(req: BatchLookupRequest): Promise<LookupResponse[]> {
+  const { vin, brand, partQueries } = req;
+  const failedBatch = (error: string): LookupResponse[] => partQueries.map(partQuery => ({
+    success: false,
+    vin,
+    partQuery,
+    results: [],
+    fromCache: false,
+    elapsedMs: 0,
+    error,
+  }));
+
+  if (!context) return failedBatch('Browser not initialized');
+
+  let page: Page | null = null;
+  try {
+    page = await context.newPage();
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    const loggedIn = await ensureLoggedIn(page);
+    if (!loggedIn) {
+      return failedBatch(authenticationRejected || await invalidCredentialsVisible(page)
+        ? 'Partslink authentication rejected'
+        : 'Login failed');
+    }
+    const vehicleFound = await navigateToVehicle(page, vin, brand);
+    if (!vehicleFound) return failedBatch('Vehicle identification failed');
+
+    const responses: LookupResponse[] = [];
+    for (let index = 0; index < partQueries.length; index += 1) {
+      const partQuery = partQueries[index];
+      const startedAt = Date.now();
+      try {
+        const timeSinceLastReq = Date.now() - lastRequestTime;
+        if (timeSinceLastReq < config.requestDelayMs) {
+          await sleep(config.requestDelayMs - timeSinceLastReq);
+        }
+        const results = await searchPart(
+          page,
+          partslinkSearchQuery(partQuery),
+          { fastAudit: process.env.PARTSLINK_FAST_AUDIT === 'true' },
+        );
+        lastRequestTime = Date.now();
+        lastSuccessfulLookup = new Date().toISOString();
+        responses.push({
+          success: true,
+          vin,
+          partQuery,
+          results,
+          fromCache: false,
+          elapsedMs: Date.now() - startedAt,
+        });
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err.message : String(err);
+        logger.warn('Batch part lookup failed', {
+          batchIndex: index + 1,
+          batchSize: partQueries.length,
+          partQuery,
+          error,
+        });
+        responses.push({
+          success: false,
+          vin,
+          partQuery,
+          results: [],
+          fromCache: false,
+          elapsedMs: Date.now() - startedAt,
+          error,
+        });
+      }
+    }
+    return responses;
+  } finally {
+    if (page) {
+      try { await page.close(); } catch { /* ignore */ }
+    }
+  }
 }
 
 async function lookupOemInternal(req: LookupRequest): Promise<LookupResponse> {
   const start = Date.now();
   const { vin, partQuery, brand } = req;
+  const catalogSearchQuery = partslinkSearchQuery(partQuery);
 
   // Rate limiting
   const timeSinceLastReq = Date.now() - lastRequestTime;
@@ -1293,14 +1774,18 @@ async function lookupOemInternal(req: LookupRequest): Promise<LookupResponse> {
 
       // Step 1: Login
       const loggedIn = await ensureLoggedIn(page);
-      if (!loggedIn) throw new Error('Login failed');
+      if (!loggedIn) {
+        throw new Error(authenticationRejected || await invalidCredentialsVisible(page)
+          ? 'Partslink authentication rejected'
+          : 'Login failed');
+      }
 
       // Step 2: Navigate to vehicle (brand + VIN)
       const vehicleFound = await navigateToVehicle(page, vin, brand);
       if (!vehicleFound) throw new Error('Vehicle identification failed');
 
       // Step 3: Search for part
-      const results = await searchPart(page, partQuery);
+      const results = await searchPart(page, catalogSearchQuery);
 
       lastRequestTime = Date.now();
       lastSuccessfulLookup = new Date().toISOString();
@@ -1312,7 +1797,10 @@ async function lookupOemInternal(req: LookupRequest): Promise<LookupResponse> {
       }
 
       return {
-        success: results.length > 0,
+        // The lookup itself completed even when this wording has no result.
+        // The comparison layer classifies a genuine empty result separately
+        // from provider and authentication failures.
+        success: true,
         vin, partQuery, results,
         fromCache: false,
         elapsedMs: Date.now() - start,
@@ -1321,19 +1809,25 @@ async function lookupOemInternal(req: LookupRequest): Promise<LookupResponse> {
 
     } catch (err: unknown) {
       retries++;
+      const errorMessage = err instanceof Error ? err.message : String(err);
       logger.warn(`Lookup attempt ${retries}/${MAX_RETRIES + 1} failed`, {
-        vin, partQuery, error: err instanceof Error ? err.message : String(err),
+        vin, partQuery, error: errorMessage,
       });
 
-      if (retries > MAX_RETRIES) {
+      const nonRetryable = errorMessage === 'Partslink authentication rejected';
+      if (nonRetryable || retries > MAX_RETRIES) {
         return {
           success: false, vin, partQuery, results: [],
           fromCache: false, elapsedMs: Date.now() - start,
-          error: `All ${MAX_RETRIES + 1} attempts failed: ${err instanceof Error ? err.message : String(err)}`,
+          error: nonRetryable
+            ? errorMessage
+            : `All ${MAX_RETRIES + 1} attempts failed: ${errorMessage}`,
         };
       }
 
-      isLoggedIn = false;
+      // A vehicle/search/navigation failure does not prove that the account
+      // session expired. The next attempt probes the shared context and only
+      // performs a new login when Partslink itself proves the session invalid.
       await humanDelay(3000, 6000);
 
     } finally {
@@ -1371,6 +1865,7 @@ export async function waitForStable(page: Page, timeout: number = NAVIGATION_TIM
 }
 
 export async function takeScreenshot(page: Page, name: string): Promise<void> {
+  if (process.env.PARTSLINK_SCREENSHOTS === 'false') return;
   try {
     const filepath = path.join(STORAGE_DIR, `${name}.png`);
     await page.screenshot({ path: filepath, fullPage: false });

@@ -12,10 +12,10 @@
  *   npm start       — Production
  */
 
-import { config } from './config';
+import { assertProductionConfig, config } from './config';
 import { logger } from './logger';
 import { initCache, cleanupExpired } from './cache';
-import { initBulkStore, recoverRunningJobs } from './bulkStore';
+import { flushExportBuffer, initBulkStore, recoverRunningJobs } from './bulkStore';
 import { initBrowser, closeBrowser } from './scraper';
 import { initOemDb, closeOemDb } from './oemDb';
 import { app } from './server';
@@ -23,6 +23,8 @@ import fs from 'fs';
 import path from 'path';
 
 async function main() {
+  assertProductionConfig();
+
   logger.info('═══════════════════════════════════════════════');
   logger.info('  🤖 CATALOG SCRAPER — PartsLink24 Automation');
   logger.info('═══════════════════════════════════════════════');
@@ -70,8 +72,10 @@ async function main() {
   logger.info('Step 3/3: Launching browser (background)...');
   initBrowser().then(() => {
     logger.info('✅ Browser ready — accepting lookups');
-  }).catch(err => {
-    logger.error('Browser init failed — lookups will return 503 until browser is ready', { error: err.message });
+  }).catch((err: unknown) => {
+    logger.error('Browser init failed — lookups will return 503 until browser is ready', {
+      error: err instanceof Error ? err.message : String(err),
+    });
   });
 
   // Schedule periodic cache cleanup (every 24h)
@@ -82,7 +86,9 @@ async function main() {
         logger.info(`🧹 Periodic cleanup: removed ${cleaned} expired cache entries`);
       }
     } catch (err: unknown) {
-      logger.error('Cache cleanup failed', { error: err.message });
+      logger.error('Cache cleanup failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }, 24 * 60 * 60 * 1000);
 }
@@ -90,6 +96,11 @@ async function main() {
 // Graceful shutdown
 async function shutdown(signal: string) {
   logger.info(`${signal} received — shutting down...`);
+  await flushExportBuffer().catch((error: unknown) => {
+    logger.error('Final export flush failed; durable outbox retained for next start', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
   await closeBrowser();
   await closeOemDb();
   process.exit(0);
@@ -101,15 +112,16 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 // Catch unhandled errors — don't crash
 process.on('unhandledRejection', (reason: unknown) => {
   logger.error('Unhandled rejection', { error: reason instanceof Error ? reason.message : String(reason) });
+  process.exit(1);
 });
 
 process.on('uncaughtException', (err: Error) => {
   logger.error('Uncaught exception', { error: err.message, stack: err.stack });
-  // Don't exit — try to keep running
+  process.exit(1);
 });
 
 // Start
-main().catch(err => {
-  logger.error('Fatal error', { error: err.message });
+main().catch((err: unknown) => {
+  logger.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
   process.exit(1);
 });

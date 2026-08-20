@@ -16,7 +16,7 @@ import { config } from './config';
 import {
   ensureLoggedIn, getContext, PL24_SERVICE_MAP,
   assertNotBlocked, sleep, humanDelay, waitForStable, takeScreenshot,
-  resetLoginState,
+  resetLoginState, runExclusiveBrowserOperation,
 } from './scraper';
 import {
   BulkJob, BulkProgressEntry,
@@ -57,7 +57,7 @@ export function getBulkState() {
 
 /** Read all values from PL24 SPA _value_ spans */
 async function readValueSpans(page: Page): Promise<string[]> {
-  return page.evaluate(`
+  return await page.evaluate(`
     (() => {
       const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
       const values = [];
@@ -134,8 +134,8 @@ function extractWidgetId(url: string): string | null {
       let seg = segments[i];
       if (!seg.startsWith('ey')) continue;
       // Double URL-decode (PL24 double-encodes)
-      try { seg = decodeURIComponent(seg); } catch {}
-      try { seg = decodeURIComponent(seg); } catch {}
+      try { seg = decodeURIComponent(seg); } catch { /* Segment war bereits dekodiert. */ }
+      try { seg = decodeURIComponent(seg); } catch { /* Zweite PL24-Dekodierung war nicht erforderlich. */ }
       // Pad base64 if needed
       while (seg.length % 4 !== 0) seg += '=';
       const json = Buffer.from(seg, 'base64').toString('utf-8');
@@ -197,7 +197,7 @@ function detectPageLevel(values: string[], url?: string): string {
  * Extract OEM numbers from the current page using multi-brand patterns.
  */
 async function extractOemsFromPage(page: Page): Promise<Array<{ oem: string; description: string }>> {
-  return page.evaluate(`
+  return await page.evaluate(`
     (() => {
       const spans = document.querySelectorAll('[class*="_value_"] span, [class*="_value_"]');
       const values = [];
@@ -284,6 +284,12 @@ export interface DiscoveredModel { brand: string; model: string; }
 export async function discoverBrandsAndModels(): Promise<{
   brands: string[]; models: DiscoveredModel[]; errors: string[];
 }> {
+  return runExclusiveBrowserOperation(discoverBrandsAndModelsExclusive);
+}
+
+async function discoverBrandsAndModelsExclusive(): Promise<{
+  brands: string[]; models: DiscoveredModel[]; errors: string[];
+}> {
   const ctx = getContext();
   if (!ctx) throw new Error('Browser not initialized');
 
@@ -304,7 +310,12 @@ export async function discoverBrandsAndModels(): Promise<{
       break;
     } catch (err: unknown) {
       retries++;
-      if (page) { try { await page.close(); } catch {} page = null; }
+      if (page) {
+        try { await page.close(); } catch (closeError) {
+          logger.debug(`Discover-Seite konnte nach Loginfehler nicht geschlossen werden: ${closeError instanceof Error ? closeError.message : String(closeError)}`);
+        }
+        page = null;
+      }
       if (retries > 2) throw new Error(`Login failed after 3 attempts`);
       resetLoginState();
       await humanDelay(1500, 3000);
@@ -382,6 +393,12 @@ export async function discoverBrandsAndModels(): Promise<{
 
 /** Crawl a SINGLE brand completely: all models → all HGs → all Bildtafeln → all OEMs */
 export async function crawlSingleBrand(brand: string): Promise<{
+  brand: string; modelsFound: number; totalOems: number; errors: string[];
+}> {
+  return runExclusiveBrowserOperation(() => crawlSingleBrandExclusive(brand));
+}
+
+async function crawlSingleBrandExclusive(brand: string): Promise<{
   brand: string; modelsFound: number; totalOems: number; errors: string[];
 }> {
   if (bulkRunning) throw new Error(`Crawler already running on ${currentBrand || 'unknown'}`);
@@ -886,7 +903,9 @@ export async function crawlSingleBrand(brand: string): Promise<{
       });
       logger.info(`📝 Job #${currentJobId} → ${finalStatus} (${totalOems} OEMs)`);
     }
-    try { await page.close(); } catch {}
+    try { await page.close(); } catch (closeError) {
+      logger.debug(`Bulk-Crawler-Seite konnte nicht geschlossen werden: ${closeError instanceof Error ? closeError.message : String(closeError)}`);
+    }
     bulkRunning = false;
     currentBrand = null;
     currentJobId = null;

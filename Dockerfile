@@ -14,16 +14,27 @@ RUN npm ci
 
 # Compile TypeScript
 COPY tsconfig.json ./
+COPY tsconfig.build.json ./
 COPY src/ ./src/
-RUN npx tsc
+COPY scripts/ ./scripts/
+RUN npm run build
 
 # Strip dev dependencies
-RUN npm prune --production
+RUN npm prune --omit=dev
 
 # ── Runtime Stage ─────────────────────────────────────────────────
 FROM node:20-slim
 
 WORKDIR /app
+
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+ARG APP_RELEASE=catalog-scraper@unversioned
+ARG VCS_REPOSITORY=https://github.com/nyroxsystems-boop/oemdetectservice
+LABEL org.opencontainers.image.source="$VCS_REPOSITORY" \
+      org.opencontainers.image.revision="$VCS_REF" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.version="$APP_RELEASE"
 
 # Store Playwright browsers in a shared, predictable location
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
@@ -48,8 +59,12 @@ EXPOSE 4100
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
   CMD node -e "const http=require('http');const r=http.get('http://localhost:4100/api/health',s=>{process.exit(s.statusCode===200?0:1)});r.on('error',()=>process.exit(1))"
 
-ENV NODE_ENV=production
-ENV HEADLESS=true
-ENV PORT=4100
+ENV NODE_ENV=production \
+    HEADLESS=true \
+    PORT=4100 \
+    APP_RELEASE="$APP_RELEASE" \
+    SENTRY_RELEASE="$APP_RELEASE" \
+    GIT_COMMIT_SHA="$VCS_REF" \
+    BUILD_DATE="$BUILD_DATE"
 
 CMD ["node", "dist/index.js"]

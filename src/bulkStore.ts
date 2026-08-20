@@ -180,6 +180,17 @@ export function initBulkStore(): void {
     CREATE INDEX IF NOT EXISTS idx_results_job ON bulk_results(job_id);
     CREATE INDEX IF NOT EXISTS idx_results_oem ON bulk_results(oem);
     CREATE INDEX IF NOT EXISTS idx_results_brand ON bulk_results(brand);
+
+    -- Durable auto-export outbox. Scraped results are committed here before
+    -- any network attempt and removed only after the Bot acknowledges them.
+    CREATE TABLE IF NOT EXISTS export_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      payload TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_export_outbox_created ON export_outbox(id);
   `);
 
   // Vehicle enrichment columns — SQLite lacks ADD COLUMN IF NOT EXISTS,
@@ -202,6 +213,8 @@ export function initBulkStore(): void {
   const vehicleCount = (db.prepare('SELECT COUNT(*) as c FROM vehicles').get() as { c: number } | undefined)?.c || 0;
   const resultCount = (db.prepare('SELECT COUNT(*) as c FROM bulk_results').get() as { c: number } | undefined)?.c || 0;
   logger.info(`Bulk store initialized — ${vehicleCount} vehicles, ${resultCount} results`, { path: DB_PATH });
+  const pendingExports = (db.prepare('SELECT COUNT(*) AS c FROM export_outbox').get() as { c: number }).c;
+  if (pendingExports > 0) scheduleExportFlush(1_000);
 }
 
 // ── Vehicle CRUD ─────────────────────────────────────────────────────────────
@@ -523,30 +536,73 @@ type ExportRow = {
   model_code?: string | null; engine?: string | null;
 };
 
-let exportBuffer: ExportRow[] = [];
 let exportTimer: ReturnType<typeof setTimeout> | null = null;
+let exportFlushInFlight: Promise<void> | null = null;
+
+function scheduleExportFlush(delayMs = EXPORT_FLUSH_INTERVAL_MS): void {
+  if (exportTimer) return;
+  exportTimer = setTimeout(() => {
+    exportTimer = null;
+    void flushExportBuffer();
+  }, delayMs);
+  exportTimer.unref?.();
+}
 
 function enqueueExport(rows: ExportRow[]): void {
-  exportBuffer.push(...rows);
-
-  // Start timer on first row if not already running
-  if (!exportTimer) {
-    exportTimer = setTimeout(() => flushExportBuffer(), EXPORT_FLUSH_INTERVAL_MS);
-  }
-
-  // Flush immediately when buffer is full
-  if (exportBuffer.length >= EXPORT_BUFFER_SIZE) {
-    flushExportBuffer();
+  const insert = db.prepare('INSERT INTO export_outbox (payload) VALUES (?)');
+  const persist = db.transaction((items: ExportRow[]) => {
+    for (let offset = 0; offset < items.length; offset += EXPORT_BUFFER_SIZE) {
+      insert.run(JSON.stringify(items.slice(offset, offset + EXPORT_BUFFER_SIZE)));
+    }
+  });
+  persist(rows);
+  const pending = (db.prepare('SELECT COUNT(*) AS c FROM export_outbox').get() as { c: number }).c;
+  if (pending > 0) {
+    scheduleExportFlush(pending >= 2 ? 0 : EXPORT_FLUSH_INTERVAL_MS);
   }
 }
 
 /** Force-flush the export buffer (called between brands + at shutdown) */
-export function flushExportBuffer(): void {
+export function flushExportBuffer(): Promise<void> {
   if (exportTimer) { clearTimeout(exportTimer); exportTimer = null; }
-  if (exportBuffer.length === 0) return;
+  if (exportFlushInFlight) return exportFlushInFlight;
+  exportFlushInFlight = flushExportOutbox().finally(() => { exportFlushInFlight = null; });
+  return exportFlushInFlight;
+}
 
-  const batch = exportBuffer.splice(0);
-  sendExportBatch(batch).catch(() => { /* silent */ });
+async function flushExportOutbox(): Promise<void> {
+  const queued = db.prepare('SELECT id, payload FROM export_outbox ORDER BY id LIMIT 10')
+    .all() as Array<{ id: number; payload: string }>;
+  if (queued.length === 0) return;
+  const rows: ExportRow[] = [];
+  const ids: number[] = [];
+  for (const item of queued) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(item.payload); } catch { parsed = null; }
+    if (!Array.isArray(parsed)) {
+      db.prepare('UPDATE export_outbox SET attempts=attempts+1,last_error=? WHERE id=?')
+        .run('invalid durable payload', item.id);
+      continue;
+    }
+    rows.push(...parsed as ExportRow[]);
+    ids.push(item.id);
+    if (rows.length >= 500) break;
+  }
+  if (rows.length === 0 || ids.length === 0) return;
+
+  try {
+    await sendExportBatch(rows);
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(`DELETE FROM export_outbox WHERE id IN (${placeholders})`).run(...ids);
+    scheduleExportFlush(0);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(`UPDATE export_outbox SET attempts=attempts+1,last_error=? WHERE id IN (${placeholders})`)
+      .run(message.slice(0, 500), ...ids);
+    logger.error(`[AutoExport] retained ${rows.length} records for retry`, { error: message });
+    scheduleExportFlush(EXPORT_FLUSH_INTERVAL_MS);
+  }
 }
 
 async function sendExportBatch(rows: ExportRow[]): Promise<void> {
@@ -554,7 +610,7 @@ async function sendExportBatch(rows: ExportRow[]): Promise<void> {
   const wwsUrl = config.wwsBotUrl;
   const token = config.adminToken;
 
-  if (!wwsUrl) return;
+  if (!wwsUrl) throw new Error('WWS_BOT_URL is not configured');
 
   const records = rows.map(r => ({
     oem: r.oem,
@@ -576,16 +632,17 @@ async function sendExportBatch(rows: ExportRow[]): Promise<void> {
       method: 'POST',
       headers,
       body: JSON.stringify({ records, source: 'partslink24-bulk-auto' }),
+      signal: AbortSignal.timeout(20_000),
     });
     if (!resp.ok) {
       const errText = await resp.text().catch(() => '');
-      logger.error(`[AutoExport] FAILED ${resp.status}: ${errText.substring(0, 200)}`);
+      throw new Error(`HTTP ${resp.status}: ${errText.substring(0, 200)}`);
     } else {
       const data = await resp.json().catch(() => ({})) as { imported?: number; skipped?: number };
       logger.info(`[AutoExport] OK: ${records.length} sent → ${data.imported || 0} imported, ${data.skipped || 0} skipped`);
     }
   } catch (err: unknown) {
-    logger.error(`[AutoExport] Error: ${err instanceof Error ? err.message : String(err)}`);
+    throw err;
   }
 }
 

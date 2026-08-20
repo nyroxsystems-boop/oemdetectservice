@@ -69,6 +69,11 @@ Request → Cache Check → Hit? → Return cached result
 | `HEADLESS` | true | Browser unsichtbar |
 | `REQUEST_DELAY_MS` | 3000 | Pause zwischen Requests |
 | `CACHE_TTL_SECONDS` | 2592000 | Cache-Gültigkeit (30 Tage) |
+| `OEM_DATABASE_URL` | — | Optionale persistente OEM-PostgreSQL-Datenbank |
+| `OEM_DATABASE_SSL_MODE` | `verify-full` | Zertifikatsprüfung; `disable` nur für interne Hosts |
+| `OEM_DATABASE_SSL_CA` | — | Optionale CA für verifiziertes TLS |
+| `OEM_DATABASE_REQUIRED` | `false` | Start ohne konfigurierte OEM-Datenbank verbieten |
+| `OEM_DATABASE_ALLOW_DEGRADED` | `false` | Nur Entwicklung: expliziter SQLite-Fallback bei DB-Fehler |
 
 ## Hinweise
 
@@ -76,3 +81,9 @@ Request → Cache Check → Hit? → Return cached result
 - Erste Anfrage dauert länger (Login + Session-Aufbau)
 - Folgende Anfragen nutzen Session-Cookies
 - Cache speichert alle erfolgreichen Lookups in SQLite
+- Eine konfigurierte OEM-Datenbank ist fail-closed: in Produktion beendet jeder
+  Verbindungs-, TLS-, Migrations- oder Schemafehler den Start. In Entwicklung ist
+  ein Fallback nur mit `OEM_DATABASE_ALLOW_DEGRADED=true` möglich.
+- OEM-Migrationen laufen transaktional unter einem Advisory Lock. Bereits
+  vorhandene Legacy-Migrationseinträge werden erst nach Schema-Prüfung mit einer
+  SHA-256-Checksumme übernommen.

@@ -9,7 +9,9 @@
  */
 
 import express, { Request, Response } from 'express';
-import { lookupOem, LookupResponse, getBrowserStatus } from './scraper';
+import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
+import { lookupOem, LookupResponse, getBrowserStatus, partslinkSearchQuery } from './scraper';
 import { getCached, setCache, getCacheStats, cleanupExpired } from './cache';
 import { getQueueStats, resetCircuitBreaker } from './requestQueue';
 import { logger } from './logger';
@@ -24,28 +26,81 @@ import { crawlBrandViaApi, getApiState, cancelApi, pauseApi, resumeApi } from '.
 import { startBrandChain, getChainState, isChainActive, pauseChain, resumeChain, cancelChain } from './brandChain';
 import { PL24_SERVICE_MAP } from './scraper';
 import { seedAllVins, getVinCount } from './vinSeeder';
+import { requireApiKey } from './httpSecurity';
 
 const app = express();
-app.use(express.json());
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(helmet());
+app.use(express.json({ limit: '64kb' }));
 
-// ── CORS — Allow dashboard to call this service from the browser ─────────────
-app.use((_req: Request, res: Response, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (_req.method === 'OPTIONS') {
+// ── CORS — explicit browser origins only; service-to-service has no Origin ───
+const allowedOrigins = new Set(config.corsAllowedOrigins);
+app.use((req: Request, res: Response, next) => {
+  const origin = req.get('origin');
+  if (origin && !allowedOrigins.has(origin)) {
+    res.status(403).json({ error: 'Origin not allowed' });
+    return;
+  }
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
+  if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
   }
   next();
 });
 
-// ── Middleware: Request logging ──────────────────────────────────────────────
+// Public liveness intentionally exposes no browser, queue, or credential state.
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.status(200).json({ status: 'ok', service: 'catalog-scraper' });
+});
+
+app.use(rateLimit({
+  windowMs: 60_000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
+app.use(requireApiKey);
 
 app.use((req: Request, res: Response, next) => {
-  if (req.path !== '/api/health') {
-    logger.info(`${req.method} ${req.path}`, { body: req.body });
-  }
+  logger.info(`${req.method} ${req.path}`);
   next();
+});
+
+// Authenticated readiness includes operational detail for automation/admins.
+app.get('/api/ready', (_req: Request, res: Response) => {
+  const browser = getBrowserStatus();
+  const queue = getQueueStats();
+  const cache = getCacheStats();
+  const isReady = browser.running && !queue.circuitBreakerOpen;
+
+  res.status(isReady ? 200 : 503).json({
+    status: isReady ? 'ready' : 'not_ready',
+    service: 'catalog-scraper',
+    browser: {
+      running: browser.running,
+      loggedIn: browser.loggedIn,
+      lastSuccessfulLookup: browser.lastSuccess,
+    },
+    queue: {
+      pending: queue.pending,
+      processing: queue.isProcessing,
+      circuitBreakerOpen: queue.circuitBreakerOpen,
+      consecutiveFailures: queue.consecutiveFailures,
+    },
+    stats: {
+      totalProcessed: queue.totalProcessed,
+      totalFailed: queue.totalFailed,
+      cacheEntries: cache.totalEntries,
+      lastSuccess: queue.lastSuccessAt,
+      lastFailure: queue.lastFailureAt,
+    },
+  });
 });
 
 // ── POST /api/lookup ─────────────────────────────────────────────────────────
@@ -57,23 +112,27 @@ interface LookupBody {
 }
 
 app.post('/api/lookup', async (req: Request<{}, {}, LookupBody>, res: Response) => {
-  const { vin, part, brand } = req.body;
+  const { vin, part, brand } = req.body || {};
 
   // Validate input
-  if (!vin || !part) {
+  if (typeof vin !== 'string' || typeof part !== 'string') {
     return res.status(400).json({ error: 'Missing required fields: vin, part' });
   }
 
-  if (vin.length < 10 || vin.length > 17) {
-    return res.status(400).json({ error: 'VIN must be 10-17 characters' });
-  }
-
-  // Normalize inputs
   const normalizedVin = vin.toUpperCase().trim();
   const normalizedPart = part.trim();
+  if (normalizedVin.length < 10 || normalizedVin.length > 17 || !/^[A-HJ-NPR-Z0-9]+$/.test(normalizedVin)) {
+    return res.status(400).json({ error: 'VIN must be 10-17 characters' });
+  }
+  if (!normalizedPart || normalizedPart.length > 200 || (brand !== undefined && (typeof brand !== 'string' || brand.length > 50))) {
+    return res.status(400).json({ error: 'Invalid part or brand' });
+  }
 
   // Step 1: Check cache
-  const cached = getCached(normalizedVin, normalizedPart);
+  // v2 bypasses legacy cache entries created from position-heavy Partslink
+  // searches. Equivalent mechanic terms share the component-only cache key.
+  const cachePart = `qa-v2:${partslinkSearchQuery(normalizedPart).toLocaleLowerCase('de-DE')}`;
+  const cached = getCached(normalizedVin, cachePart);
   if (cached) {
     logger.info('📦 Cache hit!', { vin: normalizedVin, part: normalizedPart, resultCount: cached.results.length });
     return res.json({
@@ -99,7 +158,7 @@ app.post('/api/lookup', async (req: Request<{}, {}, LookupBody>, res: Response) 
 
     // Cache only successful results with actual data
     if (result.success && result.results.length > 0) {
-      setCache(normalizedVin, normalizedPart, result.results);
+      setCache(normalizedVin, cachePart, result.results);
     }
 
     return res.json({
@@ -132,47 +191,6 @@ app.post('/api/lookup', async (req: Request<{}, {}, LookupBody>, res: Response) 
       error: errMsg,
     });
   }
-});
-
-// ── GET /api/health ──────────────────────────────────────────────────────────
-
-app.get('/api/health', (_req: Request, res: Response) => {
-  const browser = getBrowserStatus();
-  const queue = getQueueStats();
-  const cache = getCacheStats();
-
-  // Always return 200 — Railway needs this to keep the container alive.
-  // Browser may still be initializing in the background.
-  const isReady = browser.running && !queue.circuitBreakerOpen;
-
-  res.status(200).json({
-    status: isReady ? 'healthy' : 'starting',
-    service: 'catalog-scraper',
-    timestamp: new Date().toISOString(),
-    browser: {
-      running: browser.running,
-      loggedIn: browser.loggedIn,
-      lastSuccessfulLookup: browser.lastSuccess,
-    },
-    queue: {
-      pending: queue.pending,
-      processing: queue.isProcessing,
-      circuitBreakerOpen: queue.circuitBreakerOpen,
-      consecutiveFailures: queue.consecutiveFailures,
-    },
-    stats: {
-      totalProcessed: queue.totalProcessed,
-      totalFailed: queue.totalFailed,
-      cacheEntries: cache.totalEntries,
-      lastSuccess: queue.lastSuccessAt,
-      lastFailure: queue.lastFailureAt,
-    },
-    config: {
-      headless: config.headless,
-      requestDelayMs: config.requestDelayMs,
-      cacheTtlDays: Math.round(config.cacheTtlSeconds / 86400),
-    },
-  });
 });
 
 // ── POST /api/circuit-breaker/reset ──────────────────────────────────────────

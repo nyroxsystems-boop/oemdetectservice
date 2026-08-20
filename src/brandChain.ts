@@ -213,11 +213,11 @@ async function runChain(): Promise<void> {
         }
 
         // Flush buffered exports before moving to next brand
-        flushExportBuffer();
+        await flushExportBuffer();
 
         logger.info(`🔗 [Chain] ✅ ${brand} done — ${result.totalOems} OEMs, ${result.modelsFound} models, ${result.errors.length} errors`);
       } catch (err: unknown) {
-        const msg = err?.message || String(err);
+        const msg = err instanceof Error ? err.message : String(err);
         state.errors.push({ brand, message: msg, at: new Date().toISOString() });
         logger.error(`🔗 [Chain] ❌ ${brand} failed: ${msg}`);
         // Do NOT break — continue with the next brand
@@ -229,7 +229,7 @@ async function runChain(): Promise<void> {
       }
     }
   } finally {
-    flushExportBuffer();
+    await flushExportBuffer();
     state.active = false;
     state.currentIndex = state.brands.length;
     state.currentBrand = null;
