@@ -47,6 +47,13 @@ COPY package.json ./
 # Install Playwright's matching Chromium + system deps into shared path
 RUN npx playwright install chromium --with-deps
 
+# Build tooling is not needed by the running service. Apply current security
+# updates to the final OS layer, then remove npm/npx and their transitive CVEs.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/* /usr/local/lib/node_modules/npm \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx
+
 # Create data directory + non-root user
 RUN mkdir -p /app/playwright-data \
     && groupadd -r scraper && useradd -r -g scraper -G audio,video scraper \
