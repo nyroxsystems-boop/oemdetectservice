@@ -14,8 +14,16 @@ export function getRequestApiKey(req: Request): string {
   if (headerKey) return headerKey;
 
   const authorization = req.get('authorization') || '';
-  const match = authorization.match(/^Bearer\s+(.+)$/i);
-  return match?.[1]?.trim() || '';
+  const bearerPrefix = 'bearer';
+  if (
+    authorization.length <= bearerPrefix.length
+    || authorization.slice(0, bearerPrefix.length).toLowerCase() !== bearerPrefix
+    || authorization[bearerPrefix.length].trim() !== ''
+  ) {
+    return '';
+  }
+
+  return authorization.slice(bearerPrefix.length + 1).trim();
 }
 
 export function requireApiKey(req: Request, res: Response, next: NextFunction): void {
