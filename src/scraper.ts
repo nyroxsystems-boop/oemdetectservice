@@ -1871,16 +1871,40 @@ export async function waitForStable(page: Page, timeout: number = NAVIGATION_TIM
   await sleep(1000);
 }
 
+function diagnosticScreenshotFilename(name: string): string | null {
+  switch (name) {
+    case 'blocked-pre-login': return 'blocked-pre-login.png';
+    case 'blocked-post-login': return 'blocked-post-login.png';
+    case 'blocked-part-search': return 'blocked-part-search.png';
+    case 'login-no-form': return 'login-no-form.png';
+    case 'login-wrong-inputs': return 'login-wrong-inputs.png';
+    case 'login-no-password': return 'login-no-password.png';
+    case 'login-failed': return 'login-failed.png';
+    case 'login-error': return 'login-error.png';
+    case 'session-continuation-offered': return 'session-continuation-offered.png';
+    case 'login-unclear': return 'login-unclear.png';
+    case 'vin-not-found': return 'vin-not-found.png';
+    case 'vin-result': return 'vin-result.png';
+    case 'vin-no-catalog': return 'vin-no-catalog.png';
+    case 'vin-error': return 'vin-error.png';
+    case 'search-not-found': return 'search-not-found.png';
+    case 'search-results': return 'search-results.png';
+    case 'search-error': return 'search-error.png';
+    default: return null;
+  }
+}
+
 export async function takeScreenshot(page: Page, name: string): Promise<void> {
   if (process.env.PARTSLINK_SCREENSHOTS !== 'true') return;
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(name)) {
+  const filename = diagnosticScreenshotFilename(name);
+  if (!filename) {
     logger.warn('Rejected unsafe diagnostic screenshot name');
     return;
   }
   try {
     fs.mkdirSync(STORAGE_DIR, { recursive: true, mode: 0o700 });
     fs.chmodSync(STORAGE_DIR, 0o700);
-    const filepath = path.join(STORAGE_DIR, `${name}.png`);
+    const filepath = path.join(STORAGE_DIR, filename);
     await page.screenshot({ path: filepath, fullPage: false });
     fs.chmodSync(filepath, 0o600);
     logger.debug('Diagnostic screenshot captured', { name });
