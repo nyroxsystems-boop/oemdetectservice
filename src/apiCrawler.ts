@@ -26,7 +26,7 @@
  */
 
 import { Page } from 'playwright';
-import { logger } from './logger';
+import { logger, safeUrlForLog } from './logger';
 import { config } from './config';
 import {
   ensureLoggedIn, getContext, PL24_SERVICE_MAP,
@@ -88,13 +88,12 @@ interface PL24Response {
   error?: number | string;
   statusText?: string;
   debug?: {
-    responseBody?: string;
-    responseHeaders?: Record<string, string>;
-    requestUrl?: string;
-    cookies?: string;
-    url?: string;
+    responseBodyBytes?: number | null;
+    responseHeaderNames?: string[];
+    requestPath?: string;
+    pagePath?: string;
     hasAuth?: boolean;
-    headersSent?: string;
+    headerNames?: string[];
   };
 }
 
@@ -219,7 +218,7 @@ function setupHeaderCapture(page: Page): void {
       const auth = headers['authorization'] || headers['Authorization'];
       if (auth) {
         capturedSpaHeaders['authorization'] = auth;
-        logger.info(`⚡ Auth header captured: ${auth.substring(0, 50)}... (type: ${rtype})`);
+        logger.info(`⚡ Auth header captured for SPA requests (type: ${rtype})`);
       }
       const xsrf = headers['x-xsrf-token'] || headers['X-XSRF-TOKEN'];
       if (xsrf) {
@@ -283,23 +282,17 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
             headers,
           });
           if (!r.ok) {
-            // Capture response body — the error message tells us WHY
-            let responseBody = '';
-            try { responseBody = await r.text(); } catch { responseBody = '<response body unreadable>'; }
-            const respHeaders = {};
-            r.headers.forEach((v, k) => { respHeaders[k] = v; });
             return {
               error: r.status,
               statusText: r.statusText,
               data: { records: [] },
               debug: {
-                responseBody: responseBody.substring(0, 500),
-                responseHeaders: respHeaders,
-                requestUrl: ${JSON.stringify(apiPath)},
-                cookies: document.cookie.substring(0, 500),
-                url: window.location.href,
+                responseBodyBytes: Number(r.headers.get('content-length')) || null,
+                responseHeaderNames: Array.from(r.headers.keys()),
+                requestPath: new URL(${JSON.stringify(apiPath)}, window.location.origin).pathname,
+                pagePath: window.location.pathname,
                 hasAuth: !!capturedAuth,
-                headersSent: Object.keys(headers).join(', '),
+                headerNames: Object.keys(headers),
               },
             };
           }
@@ -325,21 +318,13 @@ async function pl24Fetch(page: Page, apiPath: string): Promise<PL24Response> {
       // Log comprehensive debug info for errors
       if (result.debug) {
         logger.warn(`PL24 API ${result.error} [${result.statusText}] debug:`, {
-          responseBody: result.debug.responseBody?.substring(0, 200),
-          cookies: result.debug.cookies?.substring(0, 150),
-          pageUrl: result.debug.url?.substring(0, 80),
+          responseBodyBytes: result.debug.responseBodyBytes,
+          responseHeaderNames: result.debug.responseHeaderNames,
+          requestPath: result.debug.requestPath,
+          pagePath: result.debug.pagePath,
           hasAuth: result.debug.hasAuth,
-          headersSent: result.debug.headersSent,
-          requestUrl: result.debug.requestUrl?.substring(0, 100),
+          headerNames: result.debug.headerNames,
         });
-        if (result.debug.responseHeaders) {
-          const interesting = Object.entries(result.debug.responseHeaders)
-            .filter(([k]: [string, unknown]) => /auth|token|session|www-auth|allow|csrf/i.test(k))
-            .map(([k, v]: [string, unknown]) => `${k}: ${v}`);
-          if (interesting.length > 0) {
-            logger.warn(`  Response headers: ${interesting.join(', ')}`);
-          }
-        }
       }
       throw new Error(`PL24 API ${result.error}: ${apiPath.substring(0, 80)}`);
     }
@@ -596,12 +581,12 @@ async function crawlBrandViaApiExclusive(brand: string): Promise<{
 
     // Also capture auth headers if available
     if (capturedSpaHeaders['authorization']) {
-      logger.info(`⚡ Auth header available: ${capturedSpaHeaders['authorization'].substring(0, 50)}...`);
+      logger.info('⚡ Auth header available for SPA requests');
     }
 
     const spaUrl = page.url();
     const isDemo = spaUrl.includes('/demo');
-    logger.info(`⚡ SPA URL: ${spaUrl.substring(0, 80)}${isDemo ? ' ⚠️ DEMO MODE!' : ' ✅ Authenticated'}`);
+    logger.info(`⚡ SPA URL: ${safeUrlForLog(spaUrl)}${isDemo ? ' ⚠️ DEMO MODE!' : ' ✅ Authenticated'}`);
 
     if (isDemo) {
       throw new Error('SPA loaded in demo mode — session transfer failed');

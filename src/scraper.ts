@@ -34,7 +34,7 @@ import { chromium, Browser, BrowserContext, Page, Locator } from 'playwright';
 import path from 'path';
 import fs from 'fs';
 import { config } from './config';
-import { logger } from './logger';
+import { logger, safeUrlForLog } from './logger';
 import { OemResult } from './cache';
 import { enqueue } from './requestQueue';
 import { SingleSessionGate } from './singleSessionGate';
@@ -283,7 +283,7 @@ async function login(page: Page): Promise<boolean> {
     await assertNotBlocked(page, 'pre-login');
 
     // Log current URL for debugging
-    logger.info(`Login page URL: ${page.url()}`);
+    logger.info(`Login page URL: ${safeUrlForLog(page.url())}`);
 
     // ── Find and fill the 3 login fields ──
     // Real PL24 login form:
@@ -368,13 +368,13 @@ async function login(page: Page): Promise<boolean> {
           || u.includes('pl24-app') || u.includes('partslink24/user/');
       }, { timeout: 15000 });
       loginRedirected = true;
-      logger.info(`✅ Login redirect detected: ${page.url()}`);
+      logger.info(`✅ Login redirect detected: ${safeUrlForLog(page.url())}`);
     } catch {
       // Some PL24 variants replace the page without changing the URL.
       loginRedirected = await verifyLoginSuccess(page);
       logger.info(loginRedirected
         ? 'Dashboard detected without URL change'
-        : `Post-login URL did not reach a dashboard: ${page.url()}`);
+        : `Post-login URL did not reach a dashboard: ${safeUrlForLog(page.url())}`);
     }
 
     if (!loginRedirected) {
@@ -428,12 +428,12 @@ async function login(page: Page): Promise<boolean> {
             || u.includes('pl24-app') || u.includes('partslink24/user/');
         }, { timeout: 15000 });
         loginRedirected = true;
-        logger.info(`✅ Login redirect after button click: ${page.url()}`);
+        logger.info(`✅ Login redirect after button click: ${safeUrlForLog(page.url())}`);
       } catch {
         loginRedirected = await verifyLoginSuccess(page);
         logger.warn(loginRedirected
           ? 'Dashboard detected after button click without URL change'
-          : `Still on login page after button click: ${page.url()}`);
+          : `Still on login page after button click: ${safeUrlForLog(page.url())}`);
       }
 
       if (!loginRedirected) {
@@ -459,7 +459,7 @@ async function login(page: Page): Promise<boolean> {
       dashboardLoaded = currentUrl.includes('brandmenu') || currentUrl.includes('dashboard') ||
                         currentUrl.includes('pl24-app') || currentUrl.includes('partslink24/user/');
       if (dashboardLoaded) {
-        logger.info(`Dashboard URL confirmed: ${page.url()}`);
+        logger.info(`Dashboard URL confirmed: ${safeUrlForLog(page.url())}`);
       }
     }
 
@@ -472,7 +472,7 @@ async function login(page: Page): Promise<boolean> {
                  (u.includes('brandmenu') || u.includes('dashboard') ||
                   u.includes('pl24-app') || u.includes('partslink24/user/'));
         }, { timeout: 10000 });
-        logger.info(`Dashboard URL detected: ${page.url()}`);
+        logger.info(`Dashboard URL detected: ${safeUrlForLog(page.url())}`);
         dashboardLoaded = true;
       } catch {
         logger.warn('URL did not change to dashboard');
@@ -532,7 +532,7 @@ async function login(page: Page): Promise<boolean> {
     }
 
     // Log final state for debugging
-    logger.info(`Login result: dashboardLoaded=${dashboardLoaded}, URL=${page.url()}`);
+    logger.info(`Login result: dashboardLoaded=${dashboardLoaded}, URL=${safeUrlForLog(page.url())}`);
 
     if (dashboardLoaded) {
       isLoggedIn = true;
@@ -546,10 +546,10 @@ async function login(page: Page): Promise<boolean> {
     await clearLoginFields(page);
     await takeScreenshot(page, 'login-failed');
 
-    // Debug: dump page content for diagnosis
+    // Keep diagnostics useful without copying account or page content into logs.
     try {
       const bodyText = await page.locator('body').innerText({ timeout: 5000 });
-      logger.info(`Login page body (first 300 chars): ${bodyText.substring(0, 300)}`);
+      logger.info('Login page content unavailable for authentication', { bodyCharacters: bodyText.length });
     } catch { /* ignore */ }
 
     return false;
@@ -989,7 +989,7 @@ export async function navigateToVehicle(page: Page, vin: string, brand?: string)
     await removeCookieOverlay(page);
 
     // Log current URL for debugging
-    logger.info(`Current URL: ${page.url()}`);
+    logger.info(`Current URL: ${safeUrlForLog(page.url())}`);
 
     // ── Step 1: Find VIN input on the dashboard ──
     let vinField: Locator | null = null;
@@ -1093,7 +1093,7 @@ export async function navigateToVehicle(page: Page, vin: string, brand?: string)
     // Strategy 1: Wait for URL to change to /pl24-app/ (most reliable)
     try {
       await page.waitForURL(/\/pl24-app\//, { timeout: 30000 });
-      logger.info(`✅ SPA URL detected: ${page.url()}`);
+      logger.info(`✅ SPA URL detected: ${safeUrlForLog(page.url())}`);
       catalogFound = true;
     } catch {
       logger.warn('URL did not change to /pl24-app/ within 30s');
@@ -1143,15 +1143,18 @@ export async function navigateToVehicle(page: Page, vin: string, brand?: string)
         }
       }
       await takeScreenshot(page, 'vin-result');
-      logger.info('✅ Vehicle identified — catalog loaded', { vin, url: page.url() });
+      logger.info('✅ Vehicle identified — catalog loaded', { vin, url: safeUrlForLog(page.url()) });
     } else {
       await takeScreenshot(page, 'vin-no-catalog');
-      logger.warn('Catalog not found after GO — page may still be on dashboard', { vin, url: page.url() });
+      logger.warn('Catalog not found after GO — page may still be on dashboard', {
+        vin,
+        url: safeUrlForLog(page.url()),
+      });
 
-      // Debug: dump page content
+      // Record only content length; page text can contain account and vehicle data.
       try {
         const bodyText = await page.locator('body').innerText({ timeout: 5000 });
-        logger.info(`Page body (first 500 chars): ${bodyText.substring(0, 500)}`);
+        logger.info('Catalog page did not expose a known result signal', { bodyCharacters: bodyText.length });
       } catch { /* ignore */ }
     }
 
@@ -1298,7 +1301,7 @@ async function searchPart(
 
     if (!searchField) {
       logger.error('"Teile suchen" input not found in catalog SPA!');
-      logger.info(`Current URL: ${page.url()}`);
+      logger.info(`Current URL: ${safeUrlForLog(page.url())}`);
       await takeScreenshot(page, 'search-not-found');
       throw new Error('PARTSLINK_SEARCH_FIELD_MISSING');
     }
@@ -1327,7 +1330,7 @@ async function searchPart(
     await takeScreenshot(page, 'search-results');
 
     // Log current URL (should contain ?q=...)
-    logger.info(`Search URL: ${page.url()}`);
+    logger.info(`Search URL: ${safeUrlForLog(page.url())}`);
 
     // Extract OEM results from the SPA page
     if (resultState === 'empty') {
@@ -1463,7 +1466,7 @@ async function waitForSearchResults(
 
   logger.error('No conclusive Partslink result state detected', {
     query,
-    url: page.url(),
+    url: safeUrlForLog(page.url()),
   });
   throw new Error('PARTSLINK_RESULT_STATE_UNCONFIRMED');
 }
@@ -1793,9 +1796,11 @@ async function lookupOemInternal(req: LookupRequest): Promise<LookupResponse> {
       lastSuccessfulLookup = new Date().toISOString();
 
       const screenshots: string[] = [];
-      for (const f of ['search-results.png', 'vin-result.png']) {
-        const p = path.join(STORAGE_DIR, f);
-        if (fs.existsSync(p)) screenshots.push(p);
+      if (process.env.PARTSLINK_SCREENSHOTS === 'true') {
+        for (const f of ['search-results.png', 'vin-result.png']) {
+          const p = path.join(STORAGE_DIR, f);
+          if (fs.existsSync(p)) screenshots.push(f);
+        }
       }
 
       return {
@@ -1866,12 +1871,43 @@ export async function waitForStable(page: Page, timeout: number = NAVIGATION_TIM
   await sleep(1000);
 }
 
+function diagnosticScreenshotFilename(name: string): string | null {
+  switch (name) {
+    case 'blocked-pre-login': return 'blocked-pre-login.png';
+    case 'blocked-post-login': return 'blocked-post-login.png';
+    case 'blocked-part-search': return 'blocked-part-search.png';
+    case 'login-no-form': return 'login-no-form.png';
+    case 'login-wrong-inputs': return 'login-wrong-inputs.png';
+    case 'login-no-password': return 'login-no-password.png';
+    case 'login-failed': return 'login-failed.png';
+    case 'login-error': return 'login-error.png';
+    case 'session-continuation-offered': return 'session-continuation-offered.png';
+    case 'login-unclear': return 'login-unclear.png';
+    case 'vin-not-found': return 'vin-not-found.png';
+    case 'vin-result': return 'vin-result.png';
+    case 'vin-no-catalog': return 'vin-no-catalog.png';
+    case 'vin-error': return 'vin-error.png';
+    case 'search-not-found': return 'search-not-found.png';
+    case 'search-results': return 'search-results.png';
+    case 'search-error': return 'search-error.png';
+    default: return null;
+  }
+}
+
 export async function takeScreenshot(page: Page, name: string): Promise<void> {
-  if (process.env.PARTSLINK_SCREENSHOTS === 'false') return;
+  if (process.env.PARTSLINK_SCREENSHOTS !== 'true') return;
+  const filename = diagnosticScreenshotFilename(name);
+  if (!filename) {
+    logger.warn('Rejected unsafe diagnostic screenshot name');
+    return;
+  }
   try {
-    const filepath = path.join(STORAGE_DIR, `${name}.png`);
+    fs.mkdirSync(STORAGE_DIR, { recursive: true, mode: 0o700 });
+    fs.chmodSync(STORAGE_DIR, 0o700);
+    const filepath = path.join(STORAGE_DIR, filename);
     await page.screenshot({ path: filepath, fullPage: false });
-    logger.debug(`Screenshot: ${filepath}`);
+    fs.chmodSync(filepath, 0o600);
+    logger.debug('Diagnostic screenshot captured', { name });
   } catch {
     logger.debug(`Failed to screenshot: ${name}`);
   }

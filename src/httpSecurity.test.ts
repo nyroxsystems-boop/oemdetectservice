@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { Request } from 'express';
+import type { Request } from 'express';
 import { productionConfigErrors } from './config';
 import { getRequestApiKey, secureEquals } from './httpSecurity';
 
