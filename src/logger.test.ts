@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { safeUrlForLog } from './logger';
+
+test('safeUrlForLog removes query credentials and fragments', () => {
+  assert.equal(
+    safeUrlForLog('https://catalog.example/vehicle/overview?access_token=secret#session-token'),
+    'https://catalog.example/vehicle/overview',
+  );
+});
+
+test('safeUrlForLog fails closed for invalid and non-HTTP URLs', () => {
+  assert.equal(safeUrlForLog('not a URL?token=secret'), '[invalid URL]');
+  assert.equal(safeUrlForLog('data:text/plain,secret'), '[data URL]');
+});

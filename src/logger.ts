@@ -8,6 +8,18 @@ function vinFingerprint(vin: string): string {
   return createHash('sha256').update(vin).digest('hex').slice(0, 12);
 }
 
+export function safeUrlForLog(value: string): string {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return `[${parsed.protocol.replace(':', '') || 'unknown'} URL]`;
+    }
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return '[invalid URL]';
+  }
+}
+
 function scrubString(value: string): string {
   return value.replace(VIN_RE, (vin) => `[VIN:${vinFingerprint(vin)}]`);
 }
