@@ -1,5 +1,5 @@
 # ── Build Stage ───────────────────────────────────────────────────
-FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS builder
+FROM node:22.23.2-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS builder
 
 WORKDIR /app
 
@@ -23,7 +23,7 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 # ── Runtime Stage ─────────────────────────────────────────────────
-FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
+FROM node:22.23.2-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
 
 WORKDIR /app
 
@@ -46,6 +46,13 @@ COPY package.json ./
 
 # Install Playwright's matching Chromium + system deps into shared path
 RUN npx playwright install chromium --with-deps
+
+# Build tooling is not needed by the running service. Apply current security
+# updates to the final OS layer, then remove npm/npx and their transitive CVEs.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/* /usr/local/lib/node_modules/npm \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx
 
 # Create data directory + non-root user
 RUN mkdir -p /app/playwright-data \
