@@ -1,7 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Request } from 'express';
 import { productionConfigErrors } from './config';
-import { secureEquals } from './httpSecurity';
+import { getRequestApiKey, secureEquals } from './httpSecurity';
+
+function requestWithHeaders(headers: Record<string, string | undefined>): Request {
+  return {
+    get(name: string): string | undefined {
+      return headers[name.toLowerCase()];
+    },
+  } as Request;
+}
 
 test('secureEquals accepts only the exact non-empty API key', () => {
   const key = 'a'.repeat(32);
@@ -9,6 +18,22 @@ test('secureEquals accepts only the exact non-empty API key', () => {
   assert.equal(secureEquals(`${key}x`, key), false);
   assert.equal(secureEquals('', key), false);
   assert.equal(secureEquals(key, ''), false);
+});
+
+test('getRequestApiKey prefers x-api-key and parses bearer credentials', () => {
+  assert.equal(
+    getRequestApiKey(requestWithHeaders({ 'x-api-key': ' direct-key ', authorization: 'Bearer fallback' })),
+    'direct-key',
+  );
+  assert.equal(getRequestApiKey(requestWithHeaders({ authorization: 'Bearer token-value' })), 'token-value');
+  assert.equal(getRequestApiKey(requestWithHeaders({ authorization: 'bEaReR\t token-value  ' })), 'token-value');
+});
+
+test('getRequestApiKey rejects malformed bearer credentials without a backtracking expression', () => {
+  assert.equal(getRequestApiKey(requestWithHeaders({ authorization: 'Bearer' })), '');
+  assert.equal(getRequestApiKey(requestWithHeaders({ authorization: 'BearerToken' })), '');
+  assert.equal(getRequestApiKey(requestWithHeaders({ authorization: 'Basic token-value' })), '');
+  assert.equal(getRequestApiKey(requestWithHeaders({ authorization: `Bearer ${'  '.repeat(50_000)}` })), '');
 });
 
 test('production configuration fails closed for missing credentials', () => {
