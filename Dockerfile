@@ -30,7 +30,7 @@ WORKDIR /app
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 ARG APP_RELEASE=catalog-scraper@unversioned
-ARG VCS_REPOSITORY=https://github.com/nyroxsystems-boop/oemdetectservice
+ARG VCS_REPOSITORY=https://github.com/Partsunion/oemdetectservice
 LABEL org.opencontainers.image.source="$VCS_REPOSITORY" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.created="$BUILD_DATE" \
