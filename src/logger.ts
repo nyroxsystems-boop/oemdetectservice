@@ -14,6 +14,13 @@ export function safeUrlForLog(value: string): string {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       return `[${parsed.protocol.replace(':', '') || 'unknown'} URL]`;
     }
+    if (
+      parsed.hostname.toLowerCase() === 'www.partslink24.com'
+      && parsed.pathname.startsWith('/pl24-app/')
+    ) {
+      const service = parsed.pathname.split('/').filter(Boolean)[1] || 'catalog';
+      return `${parsed.origin}/pl24-app/${service}/[CATALOG_PATH]`;
+    }
     return `${parsed.origin}${parsed.pathname}`;
   } catch {
     return '[invalid URL]';
@@ -21,7 +28,12 @@ export function safeUrlForLog(value: string): string {
 }
 
 function scrubString(value: string): string {
-  return value.replace(VIN_RE, (vin) => `[VIN:${vinFingerprint(vin)}]`);
+  return value
+    .replace(
+      /(https:\/\/www\.partslink24\.com\/pl24-app\/[^/\s"']+)\/[^\s"']+/gi,
+      '$1/[CATALOG_PATH]',
+    )
+    .replace(VIN_RE, (vin) => `[VIN:${vinFingerprint(vin)}]`);
 }
 
 function scrub(value: unknown, key = ''): unknown {

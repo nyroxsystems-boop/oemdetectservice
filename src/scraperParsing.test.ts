@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { extractFromText, partslinkSearchQuery } from './scraper';
+import {
+  extractFromPartslinkSearchPayload,
+  extractFromText,
+  partslinkSearchQuery,
+} from './scraper';
 
 test('extracts a Partslink OEM without swallowing the following field label', () => {
   const results = extractFromText(`
@@ -33,6 +37,63 @@ FG
   assert.equal(results.length, 1);
   assert.equal(results[0].oem, '11 42 7 508 968');
   assert.equal(results[0].description, 'Ölfilterdeckel');
+});
+
+test('does not parse the asynchronous result-table header as an OEM', () => {
+  const results = extractFromText(`
+Teilenummer
+Benennung (Kategorie)
+Bildtafel
+HG
+FG
+  `);
+
+  assert.deepEqual(results, []);
+});
+
+test('does not confirm an OE merely because it appears in the search text', () => {
+  const results = extractFromText(`
+Suche: 8R0941285E
+Teilenummer
+Benennung (Kategorie)
+Bildtafel
+  `);
+
+  assert.deepEqual(results, []);
+});
+
+test('extracts the exact observed Mercedes Partslink JSON search contract', () => {
+  const results = extractFromPartslinkSearchPayload({
+    search: { wid: 'search', path: 'redacted' },
+    demo: false,
+    data: {
+      records: [{
+        p5goto: { pid: 'part', ws: 'redacted' },
+        values: {
+          mg: '54',
+          sg: '09',
+          partno: 'A 642 905 01 00',
+          description: 'Differenzdrucksensor',
+        },
+      }],
+    },
+  });
+
+  assert.deepEqual(results, [{
+    oem: 'A 642 905 01 00',
+    description: 'Differenzdrucksensor',
+  }]);
+});
+
+test('treats an observed empty Mercedes JSON record list as a confirmed empty result', () => {
+  assert.deepEqual(extractFromPartslinkSearchPayload({ data: { records: [] } }), []);
+});
+
+test('fails closed for non-empty Partslink JSON records without the observed fields', () => {
+  assert.equal(extractFromPartslinkSearchPayload({
+    data: { records: [{ values: { partno: 'A 642 905 01 00' } }] },
+  }), null);
+  assert.equal(extractFromPartslinkSearchPayload({ data: { records: [{}] } }), null);
 });
 
 test('searches Partslink by component instead of noisy axle and side words', () => {

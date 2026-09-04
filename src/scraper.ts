@@ -60,6 +60,7 @@ let authenticationRejected = false;
 let lastRequestTime = 0;
 let lastSuccessfulLookup: string | null = null;
 let browserInitPromise: Promise<void> | null = null;
+let resultDomStructureLogged = false;
 const sessionGate = new SingleSessionGate();
 const browserOperationGate = new SingleSessionGate();
 
@@ -1306,6 +1307,80 @@ async function searchPart(
       throw new Error('PARTSLINK_SEARCH_FIELD_MISSING');
     }
 
+    // Diagnostic response metadata is deliberately opt-in and never records
+    // response bodies, query strings, cookies or catalogue paths.
+    const debugNetwork = process.env.PARTSLINK_DEBUG_RESULT_NETWORK === 'true';
+    const networkEvents: Array<{
+      method: string;
+      status: number;
+      resourceType: string;
+      contentType: string;
+      url: string;
+    }> = [];
+    const responseShapes: Array<{ url: string; shape: unknown }> = [];
+    const responseShapePromises: Promise<void>[] = [];
+    const networkSearch = { results: null as OemResult[] | null };
+    const jsonShape = (value: unknown, depth = 0): unknown => {
+      if (value === null) return 'null';
+      if (Array.isArray(value)) {
+        return {
+          type: 'array',
+          length: value.length,
+          ...(depth < 4 && value.length ? { first: jsonShape(value[0], depth + 1) } : {}),
+        };
+      }
+      if (typeof value === 'object') {
+        const entries = Object.entries(value as Record<string, unknown>).slice(0, 30);
+        return {
+          type: 'object',
+          keys: entries.map(([key]) => key),
+          ...(depth < 4 ? {
+            fields: Object.fromEntries(entries.map(([key, field]) => [
+              key,
+              jsonShape(field, depth + 1),
+            ])),
+          } : {}),
+        };
+      }
+      return typeof value;
+    };
+    const recordResponse = (response: any): void => {
+      const request = response.request();
+      const resourceType = request.resourceType();
+      if (!['xhr', 'fetch', 'document'].includes(resourceType)) return;
+      networkEvents.push({
+        method: request.method(),
+        status: response.status(),
+        resourceType,
+        contentType: String(response.headers()['content-type'] || '').slice(0, 120),
+        url: safeUrlForLog(response.url()),
+      });
+      const contentType = String(response.headers()['content-type'] || '');
+      const responsePath = (() => {
+        try { return new URL(response.url()).pathname; } catch { return ''; }
+      })();
+      const isDaimlerSearchResponse = responsePath === '/p5daimler/extern/search/vin';
+      if (contentType.toLowerCase().includes('application/json')
+        && (debugNetwork || isDaimlerSearchResponse)) {
+        responseShapePromises.push(response.json()
+          .then((payload: unknown) => {
+            if (isDaimlerSearchResponse) {
+              const parsed = extractFromPartslinkSearchPayload(payload);
+              if (parsed !== null) networkSearch.results = parsed;
+            }
+            if (debugNetwork) {
+              responseShapes.push({
+                url: safeUrlForLog(response.url()),
+                shape: jsonShape(payload),
+              });
+            }
+          })
+          .catch(() => undefined));
+      }
+    };
+    const observeNetwork = debugNetwork || page.url().includes('/mercedes_parts/');
+    if (observeNetwork) page.on('response', recordResponse);
+
     // Click, clear, and type search query
     await searchField.click();
     await humanDelay(options.fastAudit ? 50 : 200, options.fastAudit ? 100 : 400);
@@ -1315,12 +1390,75 @@ async function searchPart(
     await humanDelay(options.fastAudit ? 100 : 300, options.fastAudit ? 250 : 600);
     logger.info('Search query entered', { partQuery });
 
-    // Submit search (Enter key — most reliable in the SPA)
-    await searchField.press('Enter');
-    logger.info('Search submitted');
+    if (process.env.PARTSLINK_DEBUG_RESULT_DOM === 'true') {
+      await page.waitForTimeout(1_500);
+      const autocomplete = await page.locator(
+        '[role="listbox"], [role="option"], .MuiAutocomplete-popper',
+      ).evaluateAll((elements) => elements.slice(0, 30).map((element) => ({
+        tag: element.tagName.toLowerCase(),
+        role: element.getAttribute('role') || '',
+        className: String(element.className || '').slice(0, 240),
+        childCount: element.children.length,
+        text: String((element as any).innerText || '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 500),
+      }))).catch(() => []);
+      logger.info('Partslink autocomplete diagnostic', { elements: autocomplete });
+    }
 
-    // Wait for search results to appear
-    const resultState = await waitForSearchResults(page, partQuery);
+    // Most catalogues submit reliably via Enter. Some manufacturer SPAs expose
+    // a dedicated search icon and only update the URL on Enter without
+    // mounting a result state. Keep the alternate submission diagnostic-only
+    // until it has been observed against a real catalogue response.
+    if (process.env.PARTSLINK_DEBUG_CLICK_SEARCH_ICON === 'true') {
+      const searchContainer = searchField.locator(
+        'xpath=ancestor::div[contains(@class, "_searchContainer_")][1]',
+      );
+      const searchIcon = searchContainer.locator('span.icon-btn.icon--search').last();
+      if (await searchIcon.count().catch(() => 0)
+        && await searchIcon.isVisible().catch(() => false)) {
+        await searchIcon.click();
+        logger.info('Search submitted via dedicated search icon');
+      } else {
+        await searchField.press('Enter');
+        logger.info('Search icon unavailable — submitted via Enter');
+      }
+    } else {
+      await searchField.press('Enter');
+      logger.info('Search submitted');
+    }
+
+    let resultState: 'results' | 'empty' | null = null;
+    let resultStateError: unknown = null;
+    try {
+      // Wait for search results to appear
+      resultState = await waitForSearchResults(page, partQuery);
+    } catch (error) {
+      resultStateError = error;
+    } finally {
+      if (observeNetwork) {
+        page.off('response', recordResponse);
+        await Promise.allSettled(responseShapePromises);
+      }
+      if (debugNetwork) {
+        logger.info('Partslink search response diagnostic', {
+          responses: networkEvents.slice(-40),
+          responseShapes: responseShapes.slice(-20),
+        });
+      }
+    }
+    if (resultStateError) {
+      if (networkSearch.results !== null) {
+        resultState = networkSearch.results.length ? 'results' : 'empty';
+        logger.info('Search result state recovered from observed Partslink JSON contract', {
+          resultCount: networkSearch.results.length,
+        });
+      } else {
+        throw resultStateError;
+      }
+    }
+    if (!resultState) throw new Error('PARTSLINK_RESULT_STATE_UNCONFIRMED');
     await humanDelay(options.fastAudit ? 350 : 1500, options.fastAudit ? 700 : 3000);
 
     // Check for bot detection
@@ -1333,12 +1471,14 @@ async function searchPart(
     logger.info(`Search URL: ${safeUrlForLog(page.url())}`);
 
     // Extract OEM results from the SPA page
-    if (resultState === 'empty') {
+    if (resultState === 'empty' && !(networkSearch.results?.length)) {
       logger.info(`Partslink explicitly reported no OEM results for "${partQuery}"`);
       return [];
     }
 
-    const results = await extractOemResults(page);
+    const results = networkSearch.results?.length
+      ? networkSearch.results
+      : await extractOemResults(page);
     if (results.length === 0) {
       throw new Error('PARTSLINK_RESULT_EXTRACTION_EMPTY');
     }
@@ -1435,33 +1575,81 @@ async function waitForSearchResults(
     logger.debug('URL did not update with search query');
   }
 
-  // Strategy 2: Wait for result signals in the DOM
-  const resultSignals = [
-    'text=Teilenummer',                              // Result field label
-    'text=Bildtafel',                                // Result field label
-    'text=Benennung',                                // Result field label
-  ];
-
-  for (const signal of resultSignals) {
-    try {
-      await page.locator(signal).first().waitFor({ state: 'visible', timeout: 10000 });
-      logger.info(`Search results loaded — signal: "${signal}"`);
+  // Column labels are mounted before the asynchronous result rows. Treating
+  // "Teilenummer" or "Benennung (Kategorie)" as a completed result produced
+  // a bogus OEM named "Benennung" and raced the actual network response.
+  // Poll the rendered text until there is either an extractable OEM row or an
+  // explicit empty-result message.
+  const resultWaitMs = process.env.PARTSLINK_FAST_AUDIT === 'true' ? 5_000 : 15_000;
+  const deadline = Date.now() + resultWaitMs;
+  while (Date.now() < deadline) {
+    if ((await extractStructuredResultRows(page)).length > 0) {
+      logger.info('Search results loaded — structured OEM row detected');
       return 'results';
-    } catch { /* try next */ }
+    }
+    const bodyText = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
+    if (extractFromText(bodyText).length > 0) {
+      logger.info('Search results loaded — extractable OEM row detected');
+      return 'results';
+    }
+    if (/Es wurden keine Eintr(?:ä|a)ge|Keine Eintr(?:ä|a)ge gefunden|Keine Ergebnisse gefunden|Keine Treffer/i.test(bodyText)) {
+      logger.info('Partslink explicitly reported an empty result');
+      return 'empty';
+    }
+    await page.waitForTimeout(500);
   }
 
-  const emptySignals = [
-    'text=Es wurden keine Einträge',
-    'text=Keine Einträge gefunden',
-    'text=Keine Ergebnisse gefunden',
-    'text=Keine Treffer',
-  ];
-  for (const signal of emptySignals) {
-    try {
-      await page.locator(signal).first().waitFor({ state: 'visible', timeout: 3000 });
-      logger.info(`Partslink explicitly reported an empty result — signal: "${signal}"`);
-      return 'empty';
-    } catch { /* try next */ }
+  // The current SPA keeps the result-table header mounted and renders no
+  // separate empty-state text for some brand catalogues (observed for BMW).
+  // A stable search URL plus the exact table header and no data row after the
+  // full wait is therefore a confirmed empty result, not a transport error.
+  if (await page.getByText('Teilenummer', { exact: true }).count().catch(() => 0)) {
+    logger.info('Partslink result table remained header-only — treating as empty result');
+    return 'empty';
+  }
+
+  if (process.env.PARTSLINK_DEBUG_RESULT_DOM === 'true') {
+    const searchAncestors = await page.locator('input[placeholder="Teile suchen"]').first()
+      .evaluate((input) => {
+        const ancestors: Array<{
+          tag: string;
+          className: string;
+          role: string;
+          childCount: number;
+          text: string;
+        }> = [];
+        let current: any = input;
+        for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+          ancestors.push({
+            tag: current.tagName.toLowerCase(),
+            className: String(current.className || '').slice(0, 240),
+            role: current.getAttribute('role') || '',
+            childCount: current.children.length,
+            text: String(current.innerText || '')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 800),
+          });
+        }
+        return ancestors;
+      })
+      .catch(() => []);
+    const resultLikeElements = await page.locator(
+      'table, [role="table"], [role="row"], [class*="result" i], [class*="search" i]',
+    ).evaluateAll((elements) => elements.slice(0, 40).map((element) => ({
+      tag: element.tagName.toLowerCase(),
+      className: String(element.className || '').slice(0, 240),
+      role: element.getAttribute('role') || '',
+      childCount: element.children.length,
+      text: String((element as any).innerText || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 500),
+    }))).catch(() => []);
+    logger.info('Partslink unresolved result DOM diagnostic', {
+      searchAncestors,
+      resultLikeElements,
+    });
   }
 
   logger.error('No conclusive Partslink result state detected', {
@@ -1496,8 +1684,31 @@ async function waitForSearchResults(
 
 async function extractOemResults(page: Page): Promise<OemResult[]> {
   try {
-    const bodyText = await page.locator('body').innerText({ timeout: 8000 });
-    const results = extractFromText(bodyText);
+    if (process.env.PARTSLINK_DEBUG_RESULT_DOM === 'true') {
+      const diagnostics = await page.locator('text=Teilenummer').evaluateAll((nodes) => (
+        nodes.slice(0, 4).map((node) => {
+          const ancestors: Array<{ tag: string; className: string; text: string }> = [];
+          let current: any = node;
+          for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+            const text = (current.textContent || '').replace(/\s+/g, ' ').trim();
+            ancestors.push({
+              tag: current.tagName.toLowerCase(),
+              className: typeof current.className === 'string' ? current.className.slice(0, 240) : '',
+              text: text.slice(0, 800),
+            });
+          }
+          return ancestors;
+        })
+      ));
+      logger.info('Partslink result DOM diagnostic', { diagnostics });
+    }
+    const structuredResults = await extractStructuredResultRows(page);
+    const bodyText = structuredResults.length > 0
+      ? ''
+      : await page.locator('body').innerText({ timeout: 8000 });
+    const results = structuredResults.length > 0
+      ? structuredResults
+      : extractFromText(bodyText);
 
     // Deduplicate by normalized OEM + description
     const unique = new Map<string, OemResult>();
@@ -1516,6 +1727,121 @@ async function extractOemResults(page: Page): Promise<OemResult[]> {
       `PARTSLINK_RESULT_EXTRACTION_FAILED: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
+
+function usableOemText(value: string): string | null {
+  const firstLine = value.split(/\r?\n/, 1)[0].replace(/\s+/g, ' ').trim();
+  if (!/^[A-Z0-9][A-Z0-9 .-]{5,24}$/i.test(firstLine)) return null;
+  const normalized = firstLine.replace(/[\s\-.]/g, '');
+  if (normalized.length < 7 || normalized.length > 20 || !/\d/.test(normalized)) return null;
+  return firstLine;
+}
+
+/**
+ * Current Partslink SPA result table (observed 2026-08-29): a header row and
+ * one `_row_*` element per result. Each result has four `_fieldContainer_*`
+ * columns in the documented order: part number, description, category and
+ * illustration. Scoping to this container prevents the VIN, search query or
+ * unrelated navigation numbers from becoming synthetic results.
+ */
+async function extractStructuredResultRows(page: Page): Promise<OemResult[]> {
+  const headers = page.getByText('Teilenummer', { exact: true });
+  const headerCount = await headers.count().catch(() => 0);
+  for (let headerIndex = 0; headerIndex < headerCount; headerIndex += 1) {
+    const headerRow = headers.nth(headerIndex).locator('xpath=../../..');
+    const headerClass = await headerRow.getAttribute('class').catch(() => '');
+    if (!String(headerClass || '').includes('_headerRow_')) continue;
+    const container = headerRow.locator('xpath=..');
+    const rowLocators = container.locator(
+      'div[class*="_row_"]:not([class*="_headerRow_"])',
+    );
+    const rowCount = await rowLocators.count().catch(() => 0);
+    if (process.env.PARTSLINK_DEBUG_RESULT_DOM === 'true' && !resultDomStructureLogged) {
+      const structure = await container.locator('div').evaluateAll((nodes) => (
+        nodes
+          .filter((node: any) => String(node.className || '').includes('_row_'))
+          .slice(0, 5)
+          .map((node: any) => ({
+            className: String(node.className || '').slice(0, 240),
+            text: String(node.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+            children: [...node.children].slice(0, 8).map((child: any) => ({
+              tag: String(child.tagName || '').toLowerCase(),
+              className: String(child.className || '').slice(0, 240),
+              text: String(child.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+            })),
+          }))
+      ));
+      resultDomStructureLogged = true;
+      logger.info('Partslink row-structure diagnostic', {
+        headerCount,
+        headerClass,
+        containerClass: await container.getAttribute('class').catch(() => ''),
+        matchedRows: rowCount,
+        structure,
+      });
+    }
+    const results: OemResult[] = [];
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+      const row = rowLocators.nth(rowIndex);
+      const fields = row.locator(
+        ':scope > div[class*="_fieldContainer_"] > div[class*="_field_"]',
+      );
+      const fieldCount = await fields.count().catch(() => 0);
+      if (fieldCount < 2) continue;
+      const values: string[] = [];
+      for (let fieldIndex = 0; fieldIndex < Math.min(fieldCount, 4); fieldIndex += 1) {
+        values.push((await fields.nth(fieldIndex).innerText().catch(() => '')).trim());
+      }
+      const oem = usableOemText(values[0] || '');
+      if (!oem) continue;
+      results.push({
+        oem,
+        description: values[1] || '',
+        ...(values[3] ? { bildtafel: values[3] } : {}),
+      });
+    }
+    if (results.length > 0) return results;
+  }
+  return [];
+}
+
+/**
+ * Mercedes' current Partslink SPA returns search data as JSON even when its
+ * result panel does not mount in the browser. This parser accepts only the
+ * exact observed record contract and returns null for every ambiguous shape,
+ * so an unrelated JSON response can never become an OEM result.
+ */
+export function extractFromPartslinkSearchPayload(payload: unknown): OemResult[] | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const data = (payload as Record<string, unknown>).data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const records = (data as Record<string, unknown>).records;
+  if (!Array.isArray(records)) return null;
+  if (records.length === 0) return [];
+
+  const results: OemResult[] = [];
+  for (const record of records) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+    const values = (record as Record<string, unknown>).values;
+    if (!values || typeof values !== 'object' || Array.isArray(values)) return null;
+    const fields = values as Record<string, unknown>;
+    if (typeof fields.partno !== 'string' || typeof fields.description !== 'string') {
+      return null;
+    }
+    const oem = usableOemText(fields.partno);
+    if (!oem) return null;
+    results.push({
+      oem,
+      description: fields.description.replace(/\s+/g, ' ').trim(),
+    });
+  }
+
+  const unique = new Map<string, OemResult>();
+  for (const result of results) {
+    const key = `${result.oem.replace(/[\s\-.]/g, '')}|${result.description}`;
+    if (!unique.has(key)) unique.set(key, result);
+  }
+  return [...unique.values()];
 }
 
 export function extractFromText(text: string): OemResult[] {
@@ -1539,19 +1865,17 @@ export function extractFromText(text: string): OemResult[] {
     }
   }
 
-  // Strategy 3: Regex-based extraction for specific OEM formats
-  if (results.length === 0) {
-    results.push(...extractByPattern(text));
-  }
-
   return results;
 }
 
 function parseResultBlock(block: string): OemResult | null {
   const bildMatch = block.match(/Bildtafel\s+(\S+)/i);
-  // Keep the match on one line. `\s` also consumes newlines and previously
-  // appended the following "Benennung" label to otherwise valid OEM numbers.
-  const oemMatch = block.match(/Teilenummer\s+([A-Z0-9][ A-Z0-9\-.]{4,25})/i);
+  // Accept both horizontal and label/value-on-separate-line layouts, while
+  // requiring the value to end on that line. In particular, never consume the
+  // following static table header "Benennung (Kategorie)" as an OEM.
+  const oemMatch = block.match(
+    /Teilenummer[ \t]*(?:\r?\n[ \t]*)?([A-Z0-9][ A-Z0-9\-.]{4,25})[ \t]*(?=\r?\n|$)/im,
+  );
   const descMatch = block.match(/Benennung\s+(.+?)(?:\n|Bildtafel|HG\s|FG\s|$)/i);
   const hgMatch = block.match(/\bHG\s+(\d+)/i);
   const fgMatch = block.match(/\bFG\s+(\d+)/i);
@@ -1560,7 +1884,10 @@ function parseResultBlock(block: string): OemResult | null {
 
   const oem = oemMatch[1].trim();
   // Real BMW OEM: "11 42 7 508 966" = 11 chars without spaces
-  if (oem.replace(/\s/g, '').length < 7) return null;
+  const normalizedOem = oem.replace(/[\s\-.]/g, '');
+  if (normalizedOem.length < 7 || normalizedOem.length > 20 || !/\d/.test(normalizedOem)) {
+    return null;
+  }
 
   return {
     oem,
@@ -1569,41 +1896,6 @@ function parseResultBlock(block: string): OemResult | null {
     hg: hgMatch?.[1]?.trim(),
     fg: fgMatch?.[1]?.trim(),
   };
-}
-
-function extractByPattern(text: string): OemResult[] {
-  const results: OemResult[] = [];
-  const found = new Set<string>();
-
-  const patterns = [
-    /Teilenummer\s+([A-Z0-9][ A-Z0-9\-.]{6,18})/gi,         // Value capture stays on one line
-    /(\d{2}\s\d{2}\s\d\s\d{3}\s\d{3})/g,                    // BMW: "11 42 7 508 966"
-    /([A-Z]\s?\d{3}\s?\d{3}\s?\d{2}\s?\d{2})/g,             // Mercedes: "A 205 421 10 12"
-    /([A-Z0-9]{2,3}\s?\d{3}\s?\d{3}\s?[A-Z0-9]{0,2})/g,    // VAG: "5Q0 615 301 F"
-    /(9[A-Z]\d\s?\d{3}\s?\d{3}\s?\d{2})/g,                  // Porsche
-  ];
-
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-      const oem = match[1].trim();
-      const normalized = oem.replace(/\s/g, '');
-      if (normalized.length >= 7 && normalized.length <= 15 && !found.has(normalized)) {
-        found.add(normalized);
-
-        const idx = text.indexOf(oem);
-        const nearby = text.substring(Math.max(0, idx - 150), idx + oem.length + 150);
-        const descMatch = nearby.match(/Benennung\s+(.+?)(?:\n|Teilenummer|Bildtafel)/i);
-
-        results.push({
-          oem,
-          description: descMatch?.[1]?.trim() || '',
-        });
-      }
-    }
-  }
-
-  return results;
 }
 
 // ============================================================================
